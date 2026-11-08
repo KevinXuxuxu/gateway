@@ -256,7 +256,8 @@ class Handler(BaseHTTPRequestHandler):
                 t.start()
             for t in threads:
                 t.join(2.5)                # concurrent: worst case ~2 s total, not 2 s × N
-            ok = bool(threads) and all(results.get(u, False) for _, u in self.server.backends)
+            # ready if ANY backend serves — stopping one engine must not drain the gateway
+            ok = bool(threads) and any(results.get(u, False) for _, u in self.server.backends)
             _readyz["ts"] = now
             _readyz["ok"] = ok
         if _readyz["ok"]:

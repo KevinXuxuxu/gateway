@@ -40,8 +40,8 @@ file at pod start and updates never arrive.
    nodes only. Keep `--api-key` on the engines as a second factor.
 2. **readinessProbe cannot send a real key** in a manifest without leaking it. Solved:
    `/readyz` is unauthenticated and probes each upstream `GET /v1/models` (2 s timeout,
-   result cached 10 s), so a dead Mac drains traffic instead of returning 502. `/health`
-   stays liveness.
+   result cached 10 s) — **ready if at least one backend answers**, so stopping one
+   engine does not drain the gateway. `/health` stays liveness.
 3. **SSE through the ingress.** Traefik: disable compression on `text/event-stream`, set
    `flushInterval`, and raise read timeouts — otherwise long generations buffer or 504.
 4. **No shared quota state** until §8.1 is done: one replica only.

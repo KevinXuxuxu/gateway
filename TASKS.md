@@ -28,8 +28,8 @@ verify without asking anyone. Read `README.md` first; §8 is the rationale.
 ## P2 — correctness / operability
 
 - [x] **`/readyz`** probes each upstream `GET /v1/models` with a 2 s timeout (cached
-      10 s), so a dead Mac drains traffic instead of returning 502. `/health` stays
-      liveness. Used by the readinessProbe in `k8s/deployment.yaml`.
+      10 s, concurrent). **Ready if at least one backend answers** — stopping one engine
+      keeps the gateway serving the other. `/health` stays liveness.
 - [x] **Keys from the Secret, hot-reload**: re-read per request; update = re-apply the
       Secret (see `k8s/README.md`), no restart, no rollout. `keys.py` removed — mint with
       `openssl rand -hex 20`. Optional future: `PUT /admin/keys` behind a separate admin
