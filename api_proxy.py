@@ -218,12 +218,15 @@ class Handler(BaseHTTPRequestHandler):
 
     def _send_json(self, code, obj):
         body = json.dumps(obj).encode()
-        self.send_response(code)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(body)))
-        self._cors()
-        self.end_headers()
-        self.wfile.write(body)
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self._cors()
+            self.end_headers()
+            self.wfile.write(body)
+        except (BrokenPipeError, ConnectionResetError):
+            return                  # client gone (kube-probe timeout, CF 524, user cancel)
 
     def _pick_backend(self, model):
         m = (model or "").lower()
@@ -238,15 +241,22 @@ class Handler(BaseHTTPRequestHandler):
         now = time.time()
         if now - _readyz["ts"] >= 10:      # 10 s cache; no single-flight guard (low traffic)
             hdrs = {"Authorization": f"Bearer {BACKEND_KEY}"} if BACKEND_KEY else {}
-            ok = bool(self.server.backends)
-            for _, url in self.server.backends:
-                if not ok:
-                    break
+            results = {}
+
+            def probe(url):
                 try:
                     r = requests.get(f"{url}/v1/models", timeout=2, headers=hdrs)
-                    ok = r.status_code == 200
+                    results[url] = r.status_code == 200
                 except Exception:
-                    ok = False
+                    results[url] = False
+
+            threads = [threading.Thread(target=probe, args=(url,), daemon=True)
+                       for _, url in self.server.backends]
+            for t in threads:
+                t.start()
+            for t in threads:
+                t.join(2.5)                # concurrent: worst case ~2 s total, not 2 s × N
+            ok = bool(threads) and all(results.get(u, False) for _, u in self.server.backends)
             _readyz["ts"] = now
             _readyz["ok"] = ok
         if _readyz["ok"]:
