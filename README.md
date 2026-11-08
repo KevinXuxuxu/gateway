@@ -192,8 +192,16 @@ mtplx trace live | sessions | request <id> | report      CLI equivalents
 | `GATEWAY_CORS_ORIGIN` | off | CORS origin |
 | `GATEWAY_PROXY_NO_AUTH` | `0` | **testing only** |
 
-Keys: `python keys.py add <name>` / `list` / `revoke <name>` (writes 0600 JSON, no
-restart needed).
+Keys are a plain JSON file, re-read on **every request** — revoke/add takes effect on the
+next request, no restart:
+
+```json
+{"keys": [{"name": "laptop", "key": "<openssl rand -hex 20>", "created": "2025-01-01T00:00:00Z"}]}
+```
+
+In a cluster, keys live in the k8s Secret (see `k8s/README.md`): edit the JSON, re-apply
+the Secret, done — no redeploy. `keys.py` (local CLI minter) was removed; mint with
+`openssl rand -hex 20`.
 
 > **Renamed in this release:** the env prefix is now `GATEWAY_*` (was `BENCH_*`) and the
 > state dir is `~/.llm-gateway` (was `~/.bench-usage`). Old `BENCH_*` names still work for

@@ -27,12 +27,13 @@ verify without asking anyone. Read `README.md` first; §8 is the rationale.
 
 ## P2 — correctness / operability
 
-- [ ] **`/readyz`** that probes each upstream `GET /v1/models` with a 2 s timeout (cached
-      10 s), so a dead Mac drains traffic instead of returning 502. Keep `/health` as
-      liveness. See `k8s/README.md` item 2.
-- [ ] **Keys from the Secret, hot-reload**: already re-read per request — verify a
-      `kubectl create secret` + pod restart works, and add an optional
-      `PUT /admin/keys` behind a separate admin key (never expose publicly).
+- [x] **`/readyz`** probes each upstream `GET /v1/models` with a 2 s timeout (cached
+      10 s), so a dead Mac drains traffic instead of returning 502. `/health` stays
+      liveness. Used by the readinessProbe in `k8s/deployment.yaml`.
+- [x] **Keys from the Secret, hot-reload**: re-read per request; update = re-apply the
+      Secret (see `k8s/README.md`), no restart, no rollout. `keys.py` removed — mint with
+      `openssl rand -hex 20`. Optional future: `PUT /admin/keys` behind a separate admin
+      key (never expose publicly).
 - [ ] **Per-key model allowlist + max concurrency** (e.g. the "laptop" key must not use the
       256k heavy model; cap in-flight per key at 2).
 - [ ] **Upstream retry**: one bounded retry with backoff for non-streaming requests on

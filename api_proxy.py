@@ -70,6 +70,7 @@ _rl_lock = threading.Lock()
 _lock = threading.Lock()
 
 _inflight = 0                       # requests being served, for bounded drain on shutdown
+_readyz = {"ts": 0.0, "ok": False}   # cached upstream probe for /readyz
 
 
 def ensure_state():
@@ -232,10 +233,33 @@ class Handler(BaseHTTPRequestHandler):
         return None
 
     # ------------------------------------------------------------------ routing
+    def _ready(self):
+        # unauthenticated so a probe needs no key (k8s readiness cannot hold one safely)
+        now = time.time()
+        if now - _readyz["ts"] >= 10:      # 10 s cache; no single-flight guard (low traffic)
+            hdrs = {"Authorization": f"Bearer {BACKEND_KEY}"} if BACKEND_KEY else {}
+            ok = bool(self.server.backends)
+            for _, url in self.server.backends:
+                if not ok:
+                    break
+                try:
+                    r = requests.get(f"{url}/v1/models", timeout=2, headers=hdrs)
+                    ok = r.status_code == 200
+                except Exception:
+                    ok = False
+            _readyz["ts"] = now
+            _readyz["ok"] = ok
+        if _readyz["ok"]:
+            return self._json(200, {"ready": True}, reason="ready")
+        return self._json(503, {"error": {"message": "upstream engine unreachable"}},
+                          reason="backend_unreachable")
+
     def do_GET(self):
         path = urllib.parse.urlparse(self.path).path
         if path in ("/health", "/healthz"):
             return self._json(200, {"ok": True}, reason="health")
+        if path == "/readyz":
+            return self._ready()
         who = self._auth_name()
         if not who and path != "/health":
             return self._json(401, {"error": {"message": "invalid API key"}},

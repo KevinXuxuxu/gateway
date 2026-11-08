@@ -10,7 +10,7 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
-COPY api_proxy.py keys.py usage_report.py access_log.sh ./
+COPY api_proxy.py usage_report.py access_log.sh ./
 RUN useradd -u 10001 -m gateway && mkdir -p /var/lib/gateway && chown -R gateway /var/lib/gateway
 USER 10001
 ENV PATH="/app/.venv/bin:$PATH"
