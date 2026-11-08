@@ -1,5 +1,6 @@
 # Self-contained gateway image. Stateless apart from the key file and (in-memory) quotas.
 FROM python:3.12-slim
+COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
@@ -7,11 +8,12 @@ ENV PYTHONUNBUFFERED=1 \
     BENCH_LOG_STDOUT=1
 
 WORKDIR /app
-COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+COPY pyproject.toml uv.lock ./
+RUN uv sync --frozen --no-dev --no-install-project
 COPY api_proxy.py keys.py usage_report.py access_log.sh ./
 RUN useradd -u 10001 -m gateway && mkdir -p /var/lib/gateway && chown -R gateway /var/lib/gateway
 USER 10001
+ENV PATH="/app/.venv/bin:$PATH"
 
 EXPOSE 8000
 # liveness: the only unauthenticated endpoint

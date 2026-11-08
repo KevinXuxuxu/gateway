@@ -200,8 +200,8 @@ restart needed).
 ## 7. Running it
 
 ```bash
-pip install -r requirements.txt
-BENCH_BACKEND_KEY=... python api_proxy.py --port 8000 --host 0.0.0.0 \
+uv sync
+BENCH_BACKEND_KEY=... uv run api_proxy.py --port 8000 --host 0.0.0.0 \
   --backends "next=http://<mac>:8100,35b=http://<mac>:8101"
 ./scripts/smoke_test.sh http://localhost:8000 <client-key> next
 ```

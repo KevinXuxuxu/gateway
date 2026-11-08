@@ -1,5 +1,7 @@
 keys.json
 *.key
 *.jsonl
-.bench-usage/
 *.yaml
+.bench-usage/
+.venv/
+*.yaml__pycache__/

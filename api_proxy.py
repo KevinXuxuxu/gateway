@@ -23,6 +23,7 @@ import argparse
 import hashlib
 import json
 import os
+import signal
 import sys
 import threading
 import time
@@ -59,6 +60,8 @@ _rl = {}
 _rl_lock = threading.Lock()
 
 _lock = threading.Lock()
+
+_inflight = 0                       # requests being served, for bounded drain on shutdown
 
 
 def ensure_state():
@@ -153,6 +156,16 @@ class Handler(BaseHTTPRequestHandler):
     def log_message(self, fmt, *args):
         pass
 
+    def handle(self):
+        global _inflight
+        with _lock:
+            _inflight += 1
+        try:
+            super().handle()
+        finally:
+            with _lock:
+                _inflight -= 1
+
     # ------------------------------------------------------------------ helpers
     def _auth_name(self):
         h = self.headers.get("Authorization", "")
@@ -225,10 +238,15 @@ class Handler(BaseHTTPRequestHandler):
                 try:
                     hdrs = {"Authorization": f"Bearer {BACKEND_KEY}"} if BACKEND_KEY else {}
                     r = requests.get(f"{url}/v1/models", timeout=5, headers=hdrs)
+                    if r.status_code != 200:
+                        # a wrong BENCH_BACKEND_KEY lands here as 401 — do not hide it
+                        print(f"models: {url} HTTP {r.status_code}", flush=True)
+                        continue
                     for m in r.json().get("data", []):
                         if m.get("id") not in seen:
                             seen.add(m.get("id")); data.append(m)
-                except Exception:
+                except Exception as e:
+                    print(f"models: {url} unreachable: {e}", flush=True)
                     continue
             return self._json(200, {"object": "list", "data": data}, keyname=who)
         if path == "/usage/summary":
@@ -437,12 +455,29 @@ def main():
     ThreadingHTTPServer.allow_reuse_address = True
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
     srv.backends = backends
+    srv.daemon_threads = True
+    srv.block_on_close = False      # server_close must not join threads; drain below is bounded
+
+    def _stop(signum, frame):
+        # shutdown() blocks until serve_forever exits; calling it from the signal
+        # handler (same thread) would deadlock
+        threading.Thread(target=srv.shutdown, daemon=True).start()
+    signal.signal(signal.SIGTERM, _stop)
+
     print(f"proxy on http://{args.host}:{args.port} -> {backends}", flush=True)
     print(f"keys: {KEYS_FILE}  usage: {USAGE_LOG}", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
         pass
+    srv.server_close()
+    deadline = time.time() + 20     # stay under k8s default 30 s termination grace
+    while time.time() < deadline:
+        with _lock:
+            if _inflight == 0:
+                break
+        time.sleep(0.5)
+    print(f"shutdown: {_inflight} request(s) still in flight", flush=True)
 
 
 if __name__ == "__main__":
