@@ -94,7 +94,7 @@ Engine-specific behaviours you must expect (they are not gateway bugs):
 |---|---|---|
 | `400 ... maximum context length is N tokens` | prompt + generation exceeds the served window | passed through |
 | `507 insufficient memory: ... engine held X GiB ... past its Y GiB limit` | MTPLX memory guard refused the prefill | passed through; retry or shrink the prompt |
-| `401` | wrong engine key | surfaced as 502-ish failure; check `BENCH_BACKEND_KEY` |
+| `401` | wrong engine key | surfaced as 502-ish failure; check `GATEWAY_BACKEND_KEY` |
 | `usage.prompt_tokens_details.cached_tokens` | prefix-cache hits | **free** for quota purposes (§3) |
 
 ### 2.3 Engine configuration assumptions
@@ -119,7 +119,7 @@ share memory bandwidth: heavy drops ~36 %, fast c4 aggregate ~32 %.
 
 ## 3. Quota semantics (deliberate, non-obvious)
 
-`BENCH_DAILY_TOKEN_CAP` counts **compute tokens** = `(prompt_tokens − cached_tokens) +
+`GATEWAY_DAILY_TOKEN_CAP` counts **compute tokens** = `(prompt_tokens − cached_tokens) +
 completion_tokens`. Cached prefix tokens are **free**.
 
 Reason: agentic coding clients resend a 100k-token context every turn with a 95 %+ cache
@@ -127,7 +127,7 @@ hit rate; charging the raw `prompt_tokens` burns a daily budget in ~200 turns (t
 happened). If you port this to an off-the-shelf gateway (litellm, etc.) reproduce this
 rule with cache-aware pricing or a hook — a naive `tpm` limit is wrong for this workload.
 
-Rate limiting is a simple in-process sliding minute per key (`BENCH_RATE_PER_MIN`, 120).
+Rate limiting is a simple in-process sliding minute per key (`GATEWAY_RATE_PER_MIN`, 120).
 
 ---
 
@@ -135,10 +135,10 @@ Rate limiting is a simple in-process sliding minute per key (`BENCH_RATE_PER_MIN
 
 | knob | default | why |
 |---|---|---|
-| `BENCH_MAX_TOKENS` | 16384 | clamp `max_tokens` **and** `max_output_tokens`; a 32k-output request pins a serial engine for ~12 min |
-| `BENCH_MAX_PROMPT_CHARS` | 1 200 000 (~300k tok) | anti-abuse only — the model's context window is the real limit |
-| `BENCH_MAX_BODY_BYTES` | 16 MB | memory-exhaustion guard |
-| `BENCH_CORS_ORIGIN` | off | set `*` or an origin for webview/BYOK apps |
+| `GATEWAY_MAX_TOKENS` | 16384 | clamp `max_tokens` **and** `max_output_tokens`; a 32k-output request pins a serial engine for ~12 min |
+| `GATEWAY_MAX_PROMPT_CHARS` | 1 200 000 (~300k tok) | anti-abuse only — the model's context window is the real limit |
+| `GATEWAY_MAX_BODY_BYTES` | 16 MB | memory-exhaustion guard |
+| `GATEWAY_CORS_ORIGIN` | off | set `*` or an origin for webview/BYOK apps |
 
 Behind Cloudflare there is an extra hard constraint: the edge kills an origin that stays
 silent >100 s, so a **cold** prefill above ~70k tokens can 524 (measured: 108k tokens =
@@ -150,7 +150,7 @@ the first token; large cold prefills are the risk.
 ## 5. Observability contract
 
 Two JSON-lines records per request, written to files (and to **stdout** when
-`BENCH_LOG_STDOUT=1`, which is how you want it in a cluster):
+`GATEWAY_LOG_STDOUT=1`, which is how you want it in a cluster):
 
 * **access** — every request including rejections:
   `{ts, client, method, path, model, key, key_prefix, status, reason, ms, stream, bytes, ua}`
@@ -178,22 +178,26 @@ mtplx trace live | sessions | request <id> | report      CLI equivalents
 
 | env | default | meaning |
 |---|---|---|
-| `--port` / `--host` | 8000 / 127.0.0.1 | listen address |
-| `--backends` | `27b=http://127.0.0.1:8100,35b=http://127.0.0.1:8101` | `needle=url` list; needle matched against model id |
-| `BENCH_BACKEND_KEY` | – | engine key forwarded upstream (required) |
-| `BENCH_KEYS_FILE` | `~/.bench-usage/keys.json` | client keys (re-read per request) |
-| `BENCH_USAGE_DIR` | `~/.bench-usage` | state/log directory |
-| `BENCH_LOG_STDOUT` | `0` | mirror records to stdout |
-| `BENCH_MAX_TOKENS` | 16384 | output clamp |
-| `BENCH_MAX_PROMPT_CHARS` | 1 200 000 | prompt ceiling |
-| `BENCH_MAX_BODY_BYTES` | 16 MB | body ceiling |
-| `BENCH_RATE_PER_MIN` | 120 | per-key rate limit |
-| `BENCH_DAILY_TOKEN_CAP` | 200 000 000 | per-key compute tokens/day |
-| `BENCH_CORS_ORIGIN` | off | CORS origin |
-| `BENCH_PROXY_NO_AUTH` | `0` | **testing only** |
+| `GATEWAY_PORT` / `GATEWAY_HOST` (or `--port` / `--host`) | 8000 / 127.0.0.1 | listen address |
+| `GATEWAY_BACKENDS` (or `--backends`) | `27b=http://127.0.0.1:8100,35b=http://127.0.0.1:8101` | `needle=url` list; needle matched against model id |
+| `GATEWAY_BACKEND_KEY` | – | engine key forwarded upstream (required) |
+| `GATEWAY_KEYS_FILE` | `~/.llm-gateway/keys.json` | client keys (re-read per request) |
+| `GATEWAY_USAGE_DIR` | `~/.llm-gateway` | state/log directory |
+| `GATEWAY_LOG_STDOUT` | `0` | mirror records to stdout |
+| `GATEWAY_MAX_TOKENS` | 16384 | output clamp |
+| `GATEWAY_MAX_PROMPT_CHARS` | 1 200 000 | prompt ceiling |
+| `GATEWAY_MAX_BODY_BYTES` | 16 MB | body ceiling |
+| `GATEWAY_RATE_PER_MIN` | 120 | per-key rate limit |
+| `GATEWAY_DAILY_TOKEN_CAP` | 200 000 000 | per-key compute tokens/day |
+| `GATEWAY_CORS_ORIGIN` | off | CORS origin |
+| `GATEWAY_PROXY_NO_AUTH` | `0` | **testing only** |
 
 Keys: `python keys.py add <name>` / `list` / `revoke <name>` (writes 0600 JSON, no
 restart needed).
+
+> **Renamed in this release:** the env prefix is now `GATEWAY_*` (was `BENCH_*`) and the
+> state dir is `~/.llm-gateway` (was `~/.bench-usage`). Old `BENCH_*` names still work for
+> one release; to keep existing keys/history run `mv ~/.bench-usage ~/.llm-gateway`.
 
 ---
 
@@ -201,7 +205,7 @@ restart needed).
 
 ```bash
 uv sync
-BENCH_BACKEND_KEY=... uv run api_proxy.py --port 8000 --host 0.0.0.0 \
+GATEWAY_BACKEND_KEY=... uv run api_proxy.py --port 8000 --host 0.0.0.0 \
   --backends "next=http://<mac>:8100,35b=http://<mac>:8101"
 ./scripts/smoke_test.sh http://localhost:8000 <client-key> next
 ```
@@ -223,9 +227,9 @@ Ordered by how much they matter for a cluster deployment:
    token histograms (prompt/cached/completion/charged), upstream latency histogram,
    quota-denial counter, in-flight gauge. Then the ServiceMonitor actually does something.
 3. **Keys in a Secret, hot-reload.** Today it is a file re-read per request — mount a
-   k8s Secret at `BENCH_KEYS_FILE` (or add a control-plane endpoint for key CRUD).
+   k8s Secret at `GATEWAY_KEYS_FILE` (or add a control-plane endpoint for key CRUD).
    Never ship `keys.json` in an image.
-4. **Stateless log shipping.** `BENCH_LOG_STDOUT=1` is wired; make the Deployment emit
+4. **Stateless log shipping.** `GATEWAY_LOG_STDOUT=1` is wired; make the Deployment emit
    only stdout (no emptyDir needed) so promtail/fluent-bit picks it up.
 5. **Per-key policy**: model allowlist (a "laptop" key probably should not spend the
    256k-context heavy model) and per-key max concurrency.

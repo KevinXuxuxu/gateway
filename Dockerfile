@@ -4,8 +4,8 @@ COPY --from=ghcr.io/astral-sh/uv:latest /uv /uvx /bin/
 
 ENV PYTHONUNBUFFERED=1 \
     PYTHONDONTWRITEBYTECODE=1 \
-    BENCH_USAGE_DIR=/var/lib/gateway \
-    BENCH_LOG_STDOUT=1
+    GATEWAY_USAGE_DIR=/var/lib/gateway \
+    GATEWAY_LOG_STDOUT=1
 
 WORKDIR /app
 COPY pyproject.toml uv.lock ./

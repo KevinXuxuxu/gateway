@@ -12,7 +12,7 @@ Clients point at ONE base URL and pick a model:
     http://localhost:8000/v1  +  model=mtplx-qwen38-27b-optimized-quality
                                  model=mtplx-qwen36-35b-a3b-optimized-speed
 
-Every request is appended to ~/.bench-usage/usage.jsonl with the key name, model,
+Every request is appended to ~/.llm-gateway/usage.jsonl with the key name, model,
 token counts and timing (usage is taken from the OpenAI `usage` object; streaming
 requests are rewritten to ask for `stream_options.include_usage`).
 
@@ -33,29 +33,37 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import requests
 
 HOME = os.path.expanduser("~")
-STATE_DIR = os.environ.get("BENCH_USAGE_DIR", os.path.join(HOME, ".bench-usage"))
-KEYS_FILE = os.environ.get("BENCH_KEYS_FILE", os.path.join(STATE_DIR, "keys.json"))
+
+
+def _env(name, default=""):
+    """GATEWAY_* env vars, with one-release fallback to the legacy BENCH_* names."""
+    v = os.environ.get("GATEWAY_" + name)
+    return os.environ.get("BENCH_" + name, default) if v is None else v
+
+
+STATE_DIR = _env("USAGE_DIR", os.path.join(HOME, ".llm-gateway"))
+KEYS_FILE = _env("KEYS_FILE", os.path.join(STATE_DIR, "keys.json"))
 USAGE_LOG = os.path.join(STATE_DIR, "usage.jsonl")
 ACCESS_LOG = os.path.join(STATE_DIR, "access.jsonl")   # every request incl. rejections
-NO_AUTH = os.environ.get("BENCH_PROXY_NO_AUTH") == "1"
+NO_AUTH = _env("PROXY_NO_AUTH") == "1"
 # the backends authenticate with their own engine key; the proxy authenticates
 # clients against the multi-key list and forwards this credential upstream
-BACKEND_KEY = os.environ.get("BENCH_BACKEND_KEY", "")
-MAX_BODY_BYTES = int(os.environ.get("BENCH_MAX_BODY_BYTES", str(16 * 1024 * 1024)))
-MAX_COMPLETION_TOKENS = int(os.environ.get("BENCH_MAX_TOKENS", "8192"))
+BACKEND_KEY = _env("BACKEND_KEY")
+MAX_BODY_BYTES = int(_env("MAX_BODY_BYTES", str(16 * 1024 * 1024)))
+MAX_COMPLETION_TOKENS = int(_env("MAX_TOKENS", "8192"))
 # The context window is the real limit (262k on the 27B), so this is only an
 # anti-abuse ceiling for absurd bodies - not a working limit for long sessions.
-MAX_PROMPT_CHARS = int(os.environ.get("BENCH_MAX_PROMPT_CHARS", str(1_200_000)))  # ~300k tokens
-RATE_PER_MIN = int(os.environ.get("BENCH_RATE_PER_MIN", "120"))                 # per key
+MAX_PROMPT_CHARS = int(_env("MAX_PROMPT_CHARS", str(1_200_000)))  # ~300k tokens
+RATE_PER_MIN = int(_env("RATE_PER_MIN", "120"))                 # per key
 # Optional CORS for browser/webview clients (native apps don't need it).
 # Empty = disabled. Set to e.g. "*" or a specific origin to enable.
-CORS_ORIGIN = os.environ.get("BENCH_CORS_ORIGIN", "").strip()
+CORS_ORIGIN = _env("CORS_ORIGIN").strip()
 # In a cluster, ship logs via stdout (container log) instead of a shared volume.
-LOG_STDOUT = os.environ.get("BENCH_LOG_STDOUT") == "1"
+LOG_STDOUT = _env("LOG_STDOUT") == "1"
 # Quota is measured in *compute* tokens: newly prefilled + generated. Cached
 # prompt tokens are free (they cost ~nothing and caching is what makes 100k-token
 # agent sessions affordable), so they must not consume a daily allowance.
-DAILY_TOKEN_CAP = int(os.environ.get("BENCH_DAILY_TOKEN_CAP", "200000000"))      # per key, compute tokens
+DAILY_TOKEN_CAP = int(_env("DAILY_TOKEN_CAP", "200000000"))      # per key, compute tokens
 _rl = {}
 _rl_lock = threading.Lock()
 
@@ -239,7 +247,7 @@ class Handler(BaseHTTPRequestHandler):
                     hdrs = {"Authorization": f"Bearer {BACKEND_KEY}"} if BACKEND_KEY else {}
                     r = requests.get(f"{url}/v1/models", timeout=5, headers=hdrs)
                     if r.status_code != 200:
-                        # a wrong BENCH_BACKEND_KEY lands here as 401 — do not hide it
+                        # a wrong GATEWAY_BACKEND_KEY lands here as 401 — do not hide it
                         print(f"models: {url} HTTP {r.status_code}", flush=True)
                         continue
                     for m in r.json().get("data", []):
@@ -442,9 +450,9 @@ class Handler(BaseHTTPRequestHandler):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--port", type=int, default=8000)
-    ap.add_argument("--host", default="127.0.0.1")
-    ap.add_argument("--backends", default="27b=http://127.0.0.1:8100,35b=http://127.0.0.1:8101",
+    ap.add_argument("--port", type=int, default=int(_env("PORT", "8000")))
+    ap.add_argument("--host", default=_env("HOST", "127.0.0.1"))
+    ap.add_argument("--backends", default=_env("BACKENDS", "27b=http://127.0.0.1:8100,35b=http://127.0.0.1:8101"),
                     help="comma separated needle=url pairs; the needle is matched against the model id")
     args = ap.parse_args()
     ensure_state()

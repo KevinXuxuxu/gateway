@@ -3,7 +3,7 @@
 #   scripts/access_log.sh            follow, one compact line per request
 #   scripts/access_log.sh --errors   only rejected requests (status >= 400)
 #   scripts/access_log.sh --stats    per-status / per-key counters for the last 500
-LOG="$HOME/.bench-usage/access.jsonl"
+LOG="${GATEWAY_USAGE_DIR:-${BENCH_USAGE_DIR:-$HOME/.llm-gateway}}/access.jsonl"
 case "${1:-}" in
   --errors)
     tail -f "$LOG" | jq -c 'select(.status >= 400) | {ts,client,status,reason,model,key,key_prefix}' ;;

@@ -3,5 +3,6 @@ keys.json
 *.jsonl
 *.yaml
 .bench-usage/
+.llm-gateway/
 .venv/
-*.yaml__pycache__/
+__pycache__/

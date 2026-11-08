@@ -2,7 +2,7 @@
 """Summarise local model usage.
 
 Sources:
-  ~/.bench-usage/usage.jsonl          per-request records written by api_proxy.py
+  ~/.llm-gateway/usage.jsonl          per-request records written by api_proxy.py
                                       (key, model, tokens, latency)
   ~/.mtplx/logs/request-log-<port>.jsonl
                                       MTPLX's own 350-field per-request receipts
@@ -21,7 +21,13 @@ import os
 import sys
 
 HOME = os.path.expanduser("~")
-USAGE = os.environ.get("BENCH_USAGE_LOG", os.path.join(HOME, ".bench-usage", "usage.jsonl"))
+def _env(name, default=""):
+    """GATEWAY_* env vars, with one-release fallback to the legacy BENCH_* names."""
+    v = os.environ.get("GATEWAY_" + name)
+    return os.environ.get("BENCH_" + name, default) if v is None else v
+
+
+USAGE = _env("USAGE_LOG", os.path.join(HOME, ".llm-gateway", "usage.jsonl"))
 MTPLX_LOGS = os.path.join(HOME, ".mtplx", "logs", "request-log-*.jsonl")
 
 

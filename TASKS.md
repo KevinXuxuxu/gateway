@@ -8,7 +8,7 @@ verify without asking anyone. Read `README.md` first; §8 is the rationale.
 - [ ] **Move quota state out of process.** `check_quota()`/`add_tokens()` currently use a
       module dict. Replace with Redis (preferred, TTL = end of UTC day) or Postgres.
       *Accept:* two replicas share one counter; restarting a pod does not reset the day's
-      usage; `BENCH_DAILY_TOKEN_CAP` is still enforced on `(prompt − cached) + completion`.
+      usage; `GATEWAY_DAILY_TOKEN_CAP` is still enforced on `(prompt − cached) + completion`.
 
 ## P1 — observability (the reason this moved to k8s)
 
@@ -17,7 +17,7 @@ verify without asking anyone. Read `README.md` first; §8 is the rationale.
       histogram `gateway_upstream_seconds{model}`, gauge `gateway_inflight`,
       counter `gateway_quota_denials_total{reason}`.
       *Accept:* `curl :8000/metrics` shows them; `k8s/servicemonitor.yaml` scrapes.
-- [ ] **Log-shipping check:** run with `BENCH_LOG_STDOUT=1`, confirm access+usage lines
+- [ ] **Log-shipping check:** run with `GATEWAY_LOG_STDOUT=1`, confirm access+usage lines
       appear on container stdout as `{"log":"access"|"usage",...}` and reach Loki.
 - [ ] **Ship engine telemetry from the model host.** MTPLX writes
       `~/.mtplx/logs/request-log-<port>.jsonl` (TTFT, decode tok/s, cached_tokens,
@@ -53,5 +53,5 @@ verify without asking anyone. Read `README.md` first; §8 is the rationale.
 1. `Authorization: Bearer` **and** `x-api-key` both work (OpenAI and Anthropic clients).
 2. Rejections are logged *before* the response, with a stable machine-readable `reason`.
 3. Cached prompt tokens are **free** for quota (README §3).
-4. `BENCH_BACKEND_KEY` is forwarded upstream; client keys never reach the engines.
+4. `GATEWAY_BACKEND_KEY` is forwarded upstream; client keys never reach the engines.
 5. Engine ports stay private; only the gateway is exposed.

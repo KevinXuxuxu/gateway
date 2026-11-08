@@ -12,8 +12,14 @@ import sys
 import time
 
 HOME = os.path.expanduser("~")
-STATE_DIR = os.environ.get("BENCH_USAGE_DIR", os.path.join(HOME, ".bench-usage"))
-KEYS = os.environ.get("BENCH_KEYS_FILE", os.path.join(STATE_DIR, "keys.json"))
+def _env(name, default=""):
+    """GATEWAY_* env vars, with one-release fallback to the legacy BENCH_* names."""
+    v = os.environ.get("GATEWAY_" + name)
+    return os.environ.get("BENCH_" + name, default) if v is None else v
+
+
+STATE_DIR = _env("USAGE_DIR", os.path.join(HOME, ".llm-gateway"))
+KEYS = _env("KEYS_FILE", os.path.join(STATE_DIR, "keys.json"))
 
 
 def load():

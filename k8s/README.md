@@ -6,8 +6,8 @@ kubectl -n llm apply -f configmap.yaml
 # create the secret out-of-band (never commit keys):
 python ../keys.py add laptop          # prints the key; put the JSON file in the secret
 kubectl -n llm create secret generic llm-gateway-keys \
-  --from-literal=engine-key="$(cat ~/.bench-usage/engine.key)" \
-  --from-file=keys.json="$HOME/.bench-usage/keys.json"
+  --from-literal=engine-key="$(cat ~/.llm-gateway/engine.key)" \
+  --from-file=keys.json="$HOME/.llm-gateway/keys.json"
 kubectl -n llm apply -f deployment.yaml -f service.yaml -f pdb.yaml
 ```
 
@@ -26,6 +26,6 @@ Then point your existing ingress/cloudflared at `llm-gateway.llm.svc:80`.
 3. **SSE through the ingress.** Traefik: disable compression on `text/event-stream`, set
    `flushInterval`, and raise read timeouts — otherwise long generations buffer or 504.
 4. **No shared quota state** until §8.1 is done: one replica only.
-5. **Ephemeral state.** `usage.jsonl`/`access.jsonl` live in an emptyDir and vanish with
-   the pod. With `BENCH_LOG_STDOUT=1` the same records go to the container log, which is
-   what you actually want to ship.
+5. **State.** `usage.jsonl`/`access.jsonl` live on the `llm-gateway-state` PVC (k8s/pvc.yaml)
+   and survive restarts; `usage_report.py` can run against it via `kubectl exec`.
+   Keep `GATEWAY_LOG_STDOUT=1` anyway — the container log is what you ship to Loki.
