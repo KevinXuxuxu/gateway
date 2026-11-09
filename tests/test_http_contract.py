@@ -201,3 +201,68 @@ def test_chunked_body_cannot_hijack_the_connection(tmp_path):
         f"two replies on one connection: {data[:300]!r}"
     )
     assert b"Error response" not in data and b"501" not in data, data[:400]
+
+
+# --------------------------------------------------------------------------- 2
+CRASH_SHAPES = [
+    b"[1,2]",  # JSON array: no .get -> AttributeError
+    b'"hello"',  # JSON string: same
+    b'{"model":"fake-model","messages":"hello"}',  # iterating a str -> same
+    b'{"model":"fake-model","max_tokens":"abc"}',  # int() -> ValueError
+    b'{"model":"fake-model","max_tokens":"32.5"}',  # ...same
+]
+
+
+def test_unusual_bodies_get_an_answer_not_a_dropped_connection(tmp_path):
+    """Five bodies that are valid JSON but not what the handler expected.
+
+    Pre-fix each one raised inside do_POST: the thread died, the client saw
+    RemoteDisconnected, and nothing was logged or counted.
+    """
+    proc, base, _ = start_gateway(tmp_path)
+    for body in CRASH_SHAPES:
+        r = requests.post(
+            f"{base}/v1/chat/completions", data=body, headers=HDR, timeout=10
+        )
+        assert r.status_code in (200, 400), (body, r.status_code, r.text[:80])
+        assert r.headers.get("Content-Type") == "application/json", (
+            body,
+            r.status_code,
+        )
+    proc.kill()
+
+
+def test_bad_bodies_do_not_take_the_next_request_down(tmp_path):
+    """The call after a malformed body must still work, on the same connection."""
+    proc, base, _ = start_gateway(tmp_path)
+    session = requests.Session()
+    codes = []
+    for body in CRASH_SHAPES + [GOOD]:
+        codes.append(
+            session.post(
+                f"{base}/v1/chat/completions", data=body, headers=HDR, timeout=10
+            ).status_code
+        )
+    proc.kill()
+    assert codes[-1] == 200, codes  # the real request still gets a real answer
+
+
+def test_max_tokens_clamp_only_touches_real_numbers(tmp_path):
+    """The clamp must survive being made safe: ints still clamp, junk passes by."""
+    proc, base, _ = start_gateway(tmp_path)
+    requests.post(
+        f"{base}/v1/chat/completions",
+        data=b'{"model":"fake-model","max_tokens":999999,"max_output_tokens":500000}',
+        headers=HDR,
+        timeout=10,
+    )
+    requests.post(
+        f"{base}/v1/chat/completions",
+        data=b'{"model":"fake-model","max_tokens":"abc"}',
+        headers=HDR,
+        timeout=10,
+    )
+    proc.kill()
+    assert SEEN[0]["max_tokens"] == 8192, SEEN[0]  # MAX_COMPLETION_TOKENS
+    assert SEEN[0]["max_output_tokens"] == 8192, SEEN[0]
+    assert SEEN[1]["max_tokens"] == "abc", SEEN[1]  # forwarded, not crashed on

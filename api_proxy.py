@@ -517,13 +517,33 @@ class Handler(BaseHTTPRequestHandler):
                 keyname=who,
                 reason="bad_json",
             )
+        if not isinstance(body, dict):
+            # `[1,2]` and `"hello"` are valid JSON. Reading them as if they were
+            # request objects raised AttributeError, which killed the thread: the
+            # client got a dropped connection and nothing was logged.
+            return self._json(
+                400,
+                {"error": {"message": "expected a JSON object"}},
+                keyname=who,
+                reason="bad_json",
+            )
         if isinstance(body.get("input"), str):
             chars = len(body["input"])
         elif isinstance(body.get("input"), list):
             chars = sum(len(str(x)) for x in body["input"])
         else:
-            chars = sum(
-                len(str(m.get("content") or "")) for m in body.get("messages", [])
+            # `messages` can arrive as a string, a dict or a list of bare strings;
+            # counting them must not raise either. 0 skips this guard, and the
+            # engine then rejects a body it cannot read - as it does the payload.
+            msgs = body.get("messages")
+            chars = (
+                sum(
+                    len(str(m.get("content") or ""))
+                    for m in msgs
+                    if isinstance(m, dict)
+                )
+                if isinstance(msgs, list)
+                else 0
             )
         if chars > MAX_PROMPT_CHARS:
             return self._json(
@@ -540,13 +560,14 @@ class Handler(BaseHTTPRequestHandler):
                 model=body.get("model"),
                 reason=f"prompt_too_large:{chars}",
             )
-        if body.get("max_tokens") and int(body["max_tokens"]) > MAX_COMPLETION_TOKENS:
-            body["max_tokens"] = MAX_COMPLETION_TOKENS  # cost/latency guard
-        if (
-            body.get("max_output_tokens")
-            and int(body["max_output_tokens"]) > MAX_COMPLETION_TOKENS
-        ):
-            body["max_output_tokens"] = MAX_COMPLETION_TOKENS  # Responses API spelling
+        # Clamp only real integers. A client that sends `"max_tokens": "abc"` is
+        # malformed; int() on it used to raise ValueError inside the request path.
+        # Junk now goes upstream unread, like any other vendor field, and the
+        # engine answers it.
+        for field in ("max_tokens", "max_output_tokens"):
+            value = body.get(field)
+            if isinstance(value, int) and value > MAX_COMPLETION_TOKENS:
+                body[field] = MAX_COMPLETION_TOKENS
         picked = self._pick_backend(body.get("model"))
         if not picked:
             return self._json(
