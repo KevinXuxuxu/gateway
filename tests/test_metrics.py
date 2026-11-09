@@ -141,8 +141,25 @@ def start_stack(tmp_path, rate_per_min="120"):
 
 
 def metrics_text(proxy):
-    _, base, metrics_base = proxy
-    return requests.get(f"{metrics_base}/metrics", timeout=5).text
+    return requests.get(f"{proxy[2]}/metrics", timeout=5).text
+
+
+def wait_metrics(proxy, needles, timeout=10):
+    """Poll /metrics until every needle shows up.
+
+    The gateway records its counters just after writing the response, so a scrape
+    issued straight away can be early. A single scrape made the suite fail on a
+    few percent of runs with nothing wrong in the gateway.
+    """
+    deadline = time.time() + timeout
+    while True:
+        text = metrics_text(proxy)
+        missing = [n for n in needles if n not in text]
+        if not missing:
+            return text
+        if time.time() > deadline:
+            raise AssertionError("never appeared: " + ", ".join(missing) + "\n" + text)
+        time.sleep(0.05)
 
 
 def sample(text, name):
@@ -174,18 +191,15 @@ def test_metrics_end_to_end(tmp_path):
         ).status_code
         == 200
     )
-    text = metrics_text(proxy)
-    ok = 'gateway_requests_total{key="laptop",path="/v1/chat/completions",status="200"}'
-    assert ok in text, text
     # usage came from the engine: 100 prompt (60 cached) + 20 generated = 60 charged
-    assert (
-        'gateway_tokens_total{backend="fake",key="laptop",kind="prompt"} 100.0' in text
-    )
-    assert (
-        'gateway_tokens_total{backend="fake",key="laptop",kind="cached"} 60.0' in text
-    )
-    assert (
-        'gateway_tokens_total{backend="fake",key="laptop",kind="charged"} 60.0' in text
+    wait_metrics(
+        proxy,
+        [
+            'gateway_requests_total{key="laptop",path="/v1/chat/completions",status="200"}',
+            'gateway_tokens_total{backend="fake",key="laptop",kind="prompt"} 100.0',
+            'gateway_tokens_total{backend="fake",key="laptop",kind="cached"} 60.0',
+            'gateway_tokens_total{backend="fake",key="laptop",kind="charged"} 60.0',
+        ],
     )
 
     # streaming: same counters, but tagged stream="true"
@@ -198,14 +212,19 @@ def test_metrics_end_to_end(tmp_path):
         ).status_code
         == 200
     )
-    text = metrics_text(proxy)
-    assert 'gateway_upstream_seconds_count{backend="fake",stream="true"} 1.0' in text
-    assert 'gateway_upstream_seconds_count{backend="fake",stream="false"} 1.0' in text
+    wait_metrics(
+        proxy,
+        [
+            'gateway_upstream_seconds_count{backend="fake",stream="true"} 1.0',
+            'gateway_upstream_seconds_count{backend="fake",stream="false"} 1.0',
+        ],
+    )
 
     # auth failures are counted, with no key label invented from the presented token
     assert requests.get(f"{base}/v1/models", timeout=5).status_code == 401
-    text = metrics_text(proxy)
-    assert 'gateway_requests_total{key="-",path="/v1/models",status="401"} 1.0' in text
+    wait_metrics(
+        proxy, ['gateway_requests_total{key="-",path="/v1/models",status="401"} 1.0']
+    )
 
     # an engine error is counted too (that is the point of the 5xx panel)
     assert (
@@ -217,14 +236,14 @@ def test_metrics_end_to_end(tmp_path):
         ).status_code
         == 500
     )
-    assert (
-        'gateway_requests_total{key="laptop",path="/v1/chat/completions",status="500"} 1.0'
-        in metrics_text(proxy)
-    )
-
     # in-flight is released: an empty gauge still reports what it saw
-    inflight = sample(metrics_text(proxy), "gateway_upstream_inflight")
-    assert 'gateway_upstream_inflight{backend="fake"} 0.0' in inflight, inflight
+    wait_metrics(
+        proxy,
+        [
+            'gateway_requests_total{key="laptop",path="/v1/chat/completions",status="500"} 1.0',
+            'gateway_upstream_inflight{backend="fake"} 0.0',
+        ],
+    )
     proc.kill()
 
 
@@ -240,10 +259,11 @@ def test_quota_denial_is_counted(tmp_path):
         for _ in range(3)
     ]
     assert codes == [200, 200, 429], codes
-    text = metrics_text(proxy)
-    assert 'gateway_quota_denials_total{reason="rate_limit"} 1.0' in text, text
-    assert (
-        'gateway_requests_total{key="laptop",path="/v1/chat/completions",status="429"} 1.0'
-        in text
+    wait_metrics(
+        proxy,
+        [
+            'gateway_quota_denials_total{reason="rate_limit"} 1.0',
+            'gateway_requests_total{key="laptop",path="/v1/chat/completions",status="429"} 1.0',
+        ],
     )
     proc.kill()

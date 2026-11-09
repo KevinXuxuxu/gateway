@@ -11,4 +11,17 @@ dependencies = [
 [dependency-groups]
 dev = [
     "pytest>=9.2.0",
+    "ruff>=0.9.0",
 ]
+
+[tool.ruff]
+target-version = "py312"
+
+[tool.ruff.lint]
+# Pinned to ruff's documented default set. Its wider default in 0.17 flags ~29
+# deliberate `except Exception` / `open()`-without-context spots in here, which
+# would keep CI red without changing the code.
+select = ["E4", "E7", "E9", "F"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

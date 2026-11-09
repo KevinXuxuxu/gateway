@@ -242,12 +242,17 @@ the Secret, done — no redeploy. `keys.py` (local CLI minter) was removed; mint
 ## 7. Running it
 
 ```bash
-uv sync
+uv sync --group dev
 GATEWAY_BACKEND_KEY=... GATEWAY_METRICS_PORT=9091 uv run api_proxy.py --port 8000 --host 0.0.0.0 \
   --backends "next=http://<mac>:8100,35b=http://<mac>:8101"
 ./scripts/smoke_test.sh http://localhost:8000 <client-key> next   # behaviour
 uv run pytest -q                                                   # /metrics + quota accounting
+uv run ruff format --check . && uv run ruff check .                # style
 ```
+
+`.github/workflows/ci.yml` runs the last three lines on every push to `main` and on every PR.
+The dev group (`pytest`, `ruff`) is what `uv sync --group dev` installs; `uv sync` alone gives
+you the runtime only.
 
 The smoke test needs a live engine; `tests/test_metrics.py` ships its own fake one, so it runs
 anywhere. With `GATEWAY_METRICS_PORT` set, `curl localhost:9091/metrics` shows the counters after
