@@ -57,6 +57,10 @@ x-api-key: <client-key>                 (Anthropic-style clients)
 Model selection is by the `model` field only. Routing is a **substring match on the model
 id** (`next` → heavy, `35b` → fast), configured per deployment — see `--backends`.
 
+`/metrics` is **not** part of this API. It is served by a second listener on
+`GATEWAY_METRICS_PORT` (9091 in the cluster), so nothing on the public port exposes key
+names or per-key usage. There is no `/metrics` route on the app port at all.
+
 Errors are JSON `{"error": {"message": ...}}` with these codes:
 
 | code | meaning |
@@ -172,6 +176,30 @@ model host and it must be shipped separately if you want it in the same stack:
 mtplx trace live | sessions | request <id> | report      CLI equivalents
 ```
 
+### Metrics (Prometheus, on `GATEWAY_METRICS_PORT` only)
+
+| metric | labels | what it answers |
+|---|---|---|
+| `gateway_requests_total` | `status`, `key`, `path` | traffic, error mix, who is being refused |
+| `gateway_tokens_total` | `kind`, `key`, `backend` | spend per client; `kind` = prompt \| cached \| completion \| charged |
+| `gateway_upstream_seconds` | `backend`, `stream` | latency: queue + prefill + decode + client drain |
+| `gateway_upstream_inflight` | `backend` | how many requests are pinned to an engine right now |
+| `gateway_quota_denials_total` | `reason` | rate_limit / daily_token_cap, kept separate from other 429s |
+
+Three rules that keep the cardinality finite — every label above is chosen by the gateway,
+never taken from client input:
+
+* `/health` and `/readyz` are not counted at all (the kubelet would out-produce your traffic).
+* Unknown paths collapse to `path="other"`, and the model id never becomes a label. The exact
+  model, client IP and user agent are in the log records above if you need them.
+* `backend` is the routing needle from `GATEWAY_BACKENDS`, which today is 1:1 with a model.
+
+Token kinds overlap on purpose (`prompt` includes `cached`; `charged` is the §3 quota formula):
+**never sum `gateway_tokens_total` across kinds.**
+
+The Grafana dashboard built on these metrics — plus the log panels that read the records above
+out of Loki — is `kube/monitoring/grafana/dashboards/llm-gateway.json` in the turingpi repo.
+
 ---
 
 ## 6. Configuration reference
@@ -184,6 +212,8 @@ mtplx trace live | sessions | request <id> | report      CLI equivalents
 | `GATEWAY_KEYS_FILE` | `~/.llm-gateway/keys.json` | client keys (re-read per request) |
 | `GATEWAY_USAGE_DIR` | `~/.llm-gateway` | state/log directory |
 | `GATEWAY_LOG_STDOUT` | `0` | mirror records to stdout |
+| `GATEWAY_METRICS_PORT` | `0` | Prometheus listener port (9091 in the cluster); `0` = no metrics |
+| `GATEWAY_METRICS_ADDR` | `127.0.0.1` | only raise it to `0.0.0.0` where the scraper reaches the pod IP |
 | `GATEWAY_MAX_TOKENS` | 16384 | output clamp |
 | `GATEWAY_MAX_PROMPT_CHARS` | 1 200 000 | prompt ceiling |
 | `GATEWAY_MAX_BODY_BYTES` | 16 MB | body ceiling |
@@ -213,13 +243,19 @@ the Secret, done — no redeploy. `keys.py` (local CLI minter) was removed; mint
 
 ```bash
 uv sync
-GATEWAY_BACKEND_KEY=... uv run api_proxy.py --port 8000 --host 0.0.0.0 \
+GATEWAY_BACKEND_KEY=... GATEWAY_METRICS_PORT=9091 uv run api_proxy.py --port 8000 --host 0.0.0.0 \
   --backends "next=http://<mac>:8100,35b=http://<mac>:8101"
-./scripts/smoke_test.sh http://localhost:8000 <client-key> next
+./scripts/smoke_test.sh http://localhost:8000 <client-key> next   # behaviour
+uv run pytest -q                                                   # /metrics + quota accounting
 ```
 
+The smoke test needs a live engine; `tests/test_metrics.py` ships its own fake one, so it runs
+anywhere. With `GATEWAY_METRICS_PORT` set, `curl localhost:9091/metrics` shows the counters after
+the first request.
+
 Docker/k8s: `Dockerfile` + `k8s/` give a Deployment, Service, ConfigMap, Secret example,
-PDB and a Prometheus `ServiceMonitor` stub. `k8s/README.md` explains what still has to
+PDB and a Prometheus `ServiceMonitor` (for operator installs only — the checked-in
+deployments scrape with pod annotations). `k8s/README.md` explains what still has to
 change before it is production-correct (see below).
 
 ---
@@ -231,9 +267,11 @@ Ordered by how much they matter for a cluster deployment:
 1. **Quota state is in-process.** Two replicas = two independent counters, and a restart
    resets the daily cap. Move `check_quota`/`add_tokens` to Redis (or Postgres) with a
    UTC-day key. This is the single biggest correctness issue.
-2. **No `/metrics`.** Add `prometheus_client`: request counter by `{status,model,key}`,
-   token histograms (prompt/cached/completion/charged), upstream latency histogram,
-   quota-denial counter, in-flight gauge. Then the ServiceMonitor actually does something.
+2. **`/metrics` — done, and it stays off the app port.** `prometheus_client` counters, a latency
+   histogram, an in-flight gauge and a quota-denial counter, served by a second listener on
+   `GATEWAY_METRICS_PORT` (off by default): the app port is public and the series name every
+   key. Labels are chosen by the gateway only — a label built from a client-supplied model id
+   or URL is unbounded cardinality. See §5 for the list and §7 for how to scrape it.
 3. **Keys in a Secret, hot-reload.** Today it is a file re-read per request — mount a
    k8s Secret at `GATEWAY_KEYS_FILE` (or add a control-plane endpoint for key CRUD).
    Never ship `keys.json` in an image.
@@ -241,9 +279,10 @@ Ordered by how much they matter for a cluster deployment:
    only stdout (no emptyDir needed) so promtail/fluent-bit picks it up.
 5. **Per-key policy**: model allowlist (a "laptop" key probably should not spend the
    256k-context heavy model) and per-key max concurrency.
-6. **Tests**: no unit tests. Worth adding with a fake upstream (`http.server` in a thread)
-   covering: auth rejection, routing, clamps, quota accounting with cached tokens,
-   SSE passthrough, CORS preflight.
+6. **Tests**: `tests/test_metrics.py` covers the metrics path end to end against a fake
+   upstream (non-stream + SSE usage, 401/429/500, probes not counted, metrics absent from
+   the app port). Still missing: auth matrix, routing, clamps, quota accounting with cached
+   tokens, CORS preflight.
 7. **Upstream health**: `/health` only checks the gateway. Add a cheap upstream probe
    (`GET /v1/models` with a 2 s timeout, cached 10 s) and expose readiness separately from
    liveness so a dead Mac drains traffic instead of 502-ing.
@@ -267,3 +306,6 @@ Ordered by how much they matter for a cluster deployment:
   difference between "we saw 429s in the dashboard" and guessing.
 * **Cache-aware quota.** Non-standard, and the reason this gateway exists at all.
 * **No database, no admin UI on the public port.** The attack surface is one JSON handler.
+* **Metrics on a side port, never the public one.** The series name every key and its token
+  counts, and the ingress forwards every path on the app port — so there is no `/metrics`
+  there at all. Prometheus scrapes the pod directly.

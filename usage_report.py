@@ -12,6 +12,7 @@ Sources:
     python scripts/usage_report.py --days 1   # only the last N days
     python scripts/usage_report.py --json
 """
+
 import argparse
 import collections
 import datetime as dt
@@ -21,6 +22,8 @@ import os
 import sys
 
 HOME = os.path.expanduser("~")
+
+
 def _env(name, default=""):
     """GATEWAY_* env vars, with one-release fallback to the legacy BENCH_* names."""
     v = os.environ.get("GATEWAY_" + name)
@@ -33,13 +36,17 @@ MTPLX_LOGS = os.path.join(HOME, ".mtplx", "logs", "request-log-*.jsonl")
 
 def parse_ts(s):
     try:
-        return dt.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=dt.timezone.utc)
+        return dt.datetime.strptime(s, "%Y-%m-%dT%H:%M:%SZ").replace(
+            tzinfo=dt.timezone.utc
+        )
     except Exception:
         return None
 
 
 def load_proxy(days=None):
-    cutoff = dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days) if days else None
+    cutoff = (
+        dt.datetime.now(dt.timezone.utc) - dt.timedelta(days=days) if days else None
+    )
     rows = []
     try:
         for line in open(USAGE):
@@ -86,8 +93,16 @@ def main():
     proxy = load_proxy(args.days)
     mtplx = load_mtplx(args.days)
 
-    by_key = collections.defaultdict(lambda: {"requests": 0, "prompt": 0, "cached": 0,
-                                              "charged": 0, "completion": 0, "seconds": 0.0})
+    by_key = collections.defaultdict(
+        lambda: {
+            "requests": 0,
+            "prompt": 0,
+            "cached": 0,
+            "charged": 0,
+            "completion": 0,
+            "seconds": 0.0,
+        }
+    )
     for r in proxy:
         a = by_key[(r.get("key", "?"), r.get("model", "?"))]
         a["requests"] += 1
@@ -97,9 +112,17 @@ def main():
         a["completion"] += r.get("completion_tokens") or 0
         a["seconds"] += r.get("elapsed_s") or 0.0
 
-    by_model = collections.defaultdict(lambda: {"requests": 0, "prompt": 0, "cached": 0,
-                                                "charged": 0, "completion": 0,
-                                                "ttft": [], "decode": []})
+    by_model = collections.defaultdict(
+        lambda: {
+            "requests": 0,
+            "prompt": 0,
+            "cached": 0,
+            "charged": 0,
+            "completion": 0,
+            "ttft": [],
+            "decode": [],
+        }
+    )
     for r in mtplx:
         a = by_model[r.get("served_model_id") or f"port{r['_port']}"]
         a["requests"] += 1
@@ -112,26 +135,44 @@ def main():
         if r.get("decode_tok_s"):
             a["decode"].append(r["decode_tok_s"])
 
-    out = {"proxy": [{"key": k[0], "model": k[1], **v} for k, v in sorted(by_key.items())],
-           "mtplx": [{"model": m, "requests": v["requests"], "prompt_tokens": v["prompt"],
-                      "cached_tokens": v["cached"], "completion_tokens": v["completion"],
-                      "ttft_p50_s": round(sorted(v["ttft"])[len(v["ttft"]) // 2], 3) if v["ttft"] else None,
-                      "decode_tok_s_avg": round(sum(v["decode"]) / len(v["decode"]), 1) if v["decode"] else None}
-                     for m, v in sorted(by_model.items())]}
+    out = {
+        "proxy": [{"key": k[0], "model": k[1], **v} for k, v in sorted(by_key.items())],
+        "mtplx": [
+            {
+                "model": m,
+                "requests": v["requests"],
+                "prompt_tokens": v["prompt"],
+                "cached_tokens": v["cached"],
+                "completion_tokens": v["completion"],
+                "ttft_p50_s": round(sorted(v["ttft"])[len(v["ttft"]) // 2], 3)
+                if v["ttft"]
+                else None,
+                "decode_tok_s_avg": round(sum(v["decode"]) / len(v["decode"]), 1)
+                if v["decode"]
+                else None,
+            }
+            for m, v in sorted(by_model.items())
+        ],
+    }
     if args.json:
-        print(json.dumps(out, indent=2)); return 0
+        print(json.dumps(out, indent=2))
+        return 0
 
     print("== usage by API key (from the proxy log)")
     if not out["proxy"]:
         print("   no proxy records yet")
     for r in out["proxy"]:
-        print(f"   {r['key']:10s} {r['model'][:40]:40s} req={r['requests']:5d} "
-              f"in={r['prompt']:9d} (cached {r['cached']:9d}) out={r['completion']:7d} "
-              f"compute={r['charged']:9d} {r['seconds']:7.1f}s")
+        print(
+            f"   {r['key']:10s} {r['model'][:40]:40s} req={r['requests']:5d} "
+            f"in={r['prompt']:9d} (cached {r['cached']:9d}) out={r['completion']:7d} "
+            f"compute={r['charged']:9d} {r['seconds']:7.1f}s"
+        )
     print("\n== per-model traffic (from MTPLX request logs)")
     for r in out["mtplx"]:
-        print(f"   {r['model'][:44]:44s} req={r['requests']:6d} in={r['prompt_tokens']:9d} "
-              f"out={r['completion_tokens']:9d} ttft~{r['ttft_p50_s']}s decode~{r['decode_tok_s_avg']} tok/s")
+        print(
+            f"   {r['model'][:44]:44s} req={r['requests']:6d} in={r['prompt_tokens']:9d} "
+            f"out={r['completion_tokens']:9d} ttft~{r['ttft_p50_s']}s decode~{r['decode_tok_s_avg']} tok/s"
+        )
     if out["mtplx"]:
         tot_in = sum(r["prompt_tokens"] for r in out["mtplx"])
         tot_out = sum(r["completion_tokens"] for r in out["mtplx"])

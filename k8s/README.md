@@ -32,6 +32,35 @@ kubectl -n llm create secret generic llm-gateway-keys \
 No pod restart, no rollout. Do NOT mount the Secret with `subPath:` — that freezes the
 file at pod start and updates never arrive.
 
+## Metrics
+
+`GET /metrics` lives on its **own port**: 9091, enabled with `GATEWAY_METRICS_PORT` (default 0 =
+off) and bound to `GATEWAY_METRICS_ADDR` (default 127.0.0.1). It is deliberately absent from
+the app port: that one is fronted by your ingress or tunnel, and the series name every key
+and its token counts.
+
+Two scrape paths — pick one, or you collect every sample twice:
+
+* plain Prometheus: keep the `prometheus.io/{scrape,port,path}` pod annotations
+  (`k8s/deployment.yaml`); a `kubernetes-pods` job that honours them needs no other config.
+* prometheus-operator: delete those annotations and apply `k8s/servicemonitor.yaml`.
+
+Check it before trusting any panel:
+
+```bash
+kubectl -n llm port-forward deploy/llm-gateway 9091:9091 &
+curl -s localhost:9091/metrics | grep '^gateway_'      # counters appear after the first request
+```
+
+If the target never appears in Prometheus → Status → Targets, the annotations are not being read
+(no CNI/Prometheus honouring them, or an image without `/metrics` so the scrape errors instead).
+The fallback is a `static_configs` job for the pod port 9091 — one scrape path per deployment,
+never both.
+
+The Grafana dashboard (Prometheus + Loki panels) is in the turingpi repo at
+`kube/monitoring/grafana/dashboards/llm-gateway.json`: Dashboards → Import → paste, then pick
+your Prometheus and Loki datasources. It needs `GATEWAY_LOG_STDOUT=1` for the four log panels.
+
 ## Things that WILL bite you
 
 1. **Reachability of the Mac.** `BACKENDS` must use an address the cluster can reach

@@ -16,6 +16,9 @@ USER 10001
 ENV PATH="/app/.venv/bin:$PATH"
 
 EXPOSE 8000
+# Prometheus metrics, and only listening when GATEWAY_METRICS_PORT is set.
+# Nothing proxies it: the app port is the one an ingress ever fronts.
+EXPOSE 9091
 # liveness: the only unauthenticated endpoint
 HEALTHCHECK --interval=15s --timeout=3s --start-period=5s --retries=3 \
   CMD python -c "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://127.0.0.1:8000/health',timeout=2).status==200 else 1)"

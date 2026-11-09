@@ -12,11 +12,17 @@ verify without asking anyone. Read `README.md` first; §8 is the rationale.
 
 ## P1 — observability (the reason this moved to k8s)
 
-- [ ] **`/metrics` endpoint** (`prometheus_client`): counters
-      `gateway_requests_total{status,model,key}`, `gateway_tokens_total{kind="prompt|cached|completion|charged",model}`,
-      histogram `gateway_upstream_seconds{model}`, gauge `gateway_inflight`,
-      counter `gateway_quota_denials_total{reason}`.
-      *Accept:* `curl :8000/metrics` shows them; `k8s/servicemonitor.yaml` scrapes.
+- [x] **`/metrics` endpoint** (`prometheus_client`): `gateway_requests_total{status,key,path}`,
+      `gateway_tokens_total{kind="prompt|cached|completion|charged",key,backend}`,
+      histogram `gateway_upstream_seconds{backend,stream}`, gauge
+      `gateway_upstream_inflight{backend}`, counter `gateway_quota_denials_total{reason}`.
+      Served on a **second listener** (`GATEWAY_METRICS_PORT`, default 0 = off, and
+      `GATEWAY_METRICS_ADDR` default 127.0.0.1), never on the app port: that one is public
+      and the series name every key. Labels are gateway-chosen (engine needle, not the client's
+      model id) so cardinality stays finite; `/health` and `/readyz` are not counted.
+      *Accept:* `curl :9091/metrics` shows them (`tests/test_metrics.py` asserts it); the
+      deployment's `prometheus.io/{scrape,port,path}` annotations do the scraping, and
+      `k8s/servicemonitor.yaml` is the operator-only alternative.
 - [ ] **Log-shipping check:** run with `GATEWAY_LOG_STDOUT=1`, confirm access+usage lines
       appear on container stdout as `{"log":"access"|"usage",...}` and reach Loki.
 - [ ] **Ship engine telemetry from the model host.** MTPLX writes
@@ -41,9 +47,11 @@ verify without asking anyone. Read `README.md` first; §8 is the rationale.
 
 ## P3 — quality
 
-- [ ] **Tests** (`pytest`, fake upstream in a thread): auth matrix, routing, clamps,
-      cache-aware quota, SSE passthrough, CORS preflight, oversized body.
-      *Accept:* `pytest -q` green; the smoke test alone is not enough.
+- [ ] **Tests** (`pytest`, fake upstream in a thread): `tests/test_metrics.py` already runs a
+      fake MTPLX upstream and asserts the metrics side (non-stream + SSE usage, 401/429/500,
+      probes excluded, no `/metrics` on the app port). Add the rest to that file: auth matrix,
+      routing, clamps, cache-aware quota, CORS preflight, oversized body.
+      *Accept:* `uv run pytest -q` green; the smoke test alone is not enough.
 - [ ] **Ingress tuning doc** for Traefik: disable compression for `text/event-stream`,
       flush interval, read/send timeouts ≥ longest generation (1800 s).
 - [ ] **Idempotent model map**: replace needle substring routing with an explicit
