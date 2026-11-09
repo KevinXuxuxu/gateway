@@ -325,9 +325,18 @@ class Handler(BaseHTTPRequestHandler):
     def _send_json(self, code, obj):
         body = json.dumps(obj).encode()
         try:
+            # Every POST reply from here skipped reading the request body (401/413/
+            # 429) or the body was junk (400/404). With HTTP/1.1 keep-alive the
+            # leftovers would be parsed as the client's *next* request, so end the
+            # connection instead - what http.server's own send_error does. One
+            # reconnect per rejected call, instead of an answer for the wrong one.
+            end_connection = self.command == "POST"
             self.send_response(code)
             self.send_header("Content-Type", "application/json")
             self.send_header("Content-Length", str(len(body)))
+            if end_connection:
+                self.send_header("Connection", "close")
+                self.close_connection = True
             self._cors()
             self.end_headers()
             self.wfile.write(body)
