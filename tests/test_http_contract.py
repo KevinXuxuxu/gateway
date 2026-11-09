@@ -66,9 +66,16 @@ def free_port():
         return s.getsockname()[1]
 
 
-def start_gateway(tmp_path, **overrides):
-    """Real gateway process + fake engine -> (proc, base_url, proxy_port)."""
+def start_gateway(tmp_path, break_logs=False, **overrides):
+    """Real gateway process + fake engine -> (proc, base_url, proxy_port).
+
+    break_logs=True makes both log paths unwritable, which is what a read-only or
+    full volume, or a failed mount, looks like to the code.
+    """
     SEEN.clear()
+    if break_logs:
+        for name in ("access.jsonl", "usage.jsonl"):
+            (tmp_path / name).mkdir()
     keys = tmp_path / "keys.json"
     keys.write_text(json.dumps({"keys": [{"name": "laptop", "key": KEY}]}))
     engine_port, proxy_port = free_port(), free_port()
@@ -266,3 +273,64 @@ def test_max_tokens_clamp_only_touches_real_numbers(tmp_path):
     assert SEEN[0]["max_tokens"] == 8192, SEEN[0]  # MAX_COMPLETION_TOKENS
     assert SEEN[0]["max_output_tokens"] == 8192, SEEN[0]
     assert SEEN[1]["max_tokens"] == "abc", SEEN[1]  # forwarded, not crashed on
+
+
+# --------------------------------------------------------------------------- 3
+def test_unwritable_logs_do_not_take_the_gateway_down(tmp_path):
+    """Both log files unwritable, as they are on a read-only or full volume.
+
+    Pre-fix the OSError from the log write propagated out of the handler, so
+    /health and /readyz stopped answering too - which pulls the pod out of
+    service. The same run also checks the request is still counted in metrics,
+    which the failed write used to skip.
+    """
+    metrics_port = free_port()
+    proc, base, _ = start_gateway(
+        tmp_path,
+        break_logs=True,
+        GATEWAY_METRICS_PORT=str(metrics_port),
+        GATEWAY_RATE_PER_MIN="2",
+    )
+    metrics = f"http://127.0.0.1:{metrics_port}/metrics"
+
+    assert requests.get(f"{base}/health", timeout=5).status_code == 200
+    assert requests.get(f"{base}/readyz", timeout=5).status_code == 200
+    assert (
+        requests.get(f"{base}/usage/summary", headers=HDR, timeout=5).status_code == 200
+    )
+
+    chat = f"{base}/v1/chat/completions"
+    codes = [
+        requests.post(chat, data=GOOD, headers=HDR, timeout=15).status_code
+        for _ in range(4)
+    ]
+    denials = requests.get(f"{base}/nope", headers=HDR, timeout=5).status_code
+    time.sleep(0.3)  # let the last writes be attempted
+    text = requests.get(metrics, timeout=5).text
+    proc.kill()
+    proc.wait(timeout=10)
+    out = proc.stdout.read()
+
+    assert codes == [200, 200, 429, 429], codes  # quota still enforced, and answered
+    assert denials == 404
+    # the request was counted even though its log line went nowhere
+    assert (
+        'gateway_requests_total{key="laptop",path="/v1/chat/completions",status="200"} 2.0'
+        in text
+    )
+    assert 'gateway_quota_denials_total{reason="rate_limit"} 2.0' in text
+    # and the broken logging is said once per file, not once per request
+    assert out.count("logging disabled") == 2, out[-500:]
+
+
+def test_writable_logs_are_still_written(tmp_path):
+    """The escape hatch must not quietly disable the file logs."""
+    proc, base, _ = start_gateway(tmp_path)
+    requests.post(f"{base}/v1/chat/completions", data=GOOD, headers=HDR, timeout=15)
+    time.sleep(0.5)
+    lines = (tmp_path / "access.jsonl").read_text().splitlines()
+    usage = (tmp_path / "usage.jsonl").read_text().splitlines()
+    proc.kill()
+    assert len(lines) == 2, lines  # the readiness probe from the harness + the chat
+    assert '"path": "/v1/chat/completions"' in lines[-1], lines[-1]
+    assert len(usage) == 1, usage

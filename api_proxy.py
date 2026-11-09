@@ -207,14 +207,34 @@ def add_tokens(who, n):
         st["tokens"] = st.get("tokens", 0) + int(n)
 
 
+_broken_logs = set()  # paths that failed a write; complained about once
+
+
+def append_log(path, line):
+    """Append one line to a log file, if that file can be written at all.
+
+    Losing a log line is bad; losing the request is worse. /health and /readyz
+    write here too, so letting a write error escape stops the probes answering,
+    which on k8s pulls the pod out of service over a read-only or full volume.
+    The counter in log_access is also after this call, so raising here silently
+    dropped the request from the metrics as well. Say it once per path, then be
+    quiet: a dead volume must not flood stdout with one line per request.
+    """
+    try:
+        with _lock, open(path, "a") as f:
+            f.write(line + "\n")
+    except OSError as e:
+        if path not in _broken_logs:
+            _broken_logs.add(path)
+            print(f"logging disabled for {path}: {e}", flush=True)
+
+
 def log_access(rec):
     """Append one line per HTTP request: accepted *and* rejected."""
     line = json.dumps(rec)
     if LOG_STDOUT:
         print(json.dumps({"log": "access", **rec}), flush=True)
-    with _lock:
-        with open(ACCESS_LOG, "a") as f:
-            f.write(line + "\n")
+    append_log(ACCESS_LOG, line)
     count_request(rec)
 
 
@@ -246,9 +266,7 @@ def record_upstream(backend, who, usage, charged, secs, stream):
 def log_usage(rec):
     if LOG_STDOUT:
         print(json.dumps({"log": "usage", **rec}), flush=True)
-    with _lock:
-        with open(USAGE_LOG, "a") as f:
-            f.write(json.dumps(rec) + "\n")
+    append_log(USAGE_LOG, json.dumps(rec))
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -459,8 +477,8 @@ class Handler(BaseHTTPRequestHandler):
                 a["charged_tokens"] += r.get("charged_tokens") or 0
                 a["completion_tokens"] += r.get("completion_tokens") or 0
                 a["seconds"] += r.get("elapsed_s") or 0
-        except FileNotFoundError:
-            pass
+        except OSError:
+            pass  # no log file yet, or a log path that cannot be opened
         return {
             "by_key_model": [{"key": k[0], "model": k[1], **v} for k, v in agg.items()]
         }
