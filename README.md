@@ -303,9 +303,11 @@ Ordered by how much they matter for a cluster deployment:
 7. **Upstream health**: `/health` only checks the gateway. Add a cheap upstream probe
    (`GET /v1/models` with a 2 s timeout, cached 10 s) and expose readiness separately from
    liveness so a dead Mac drains traffic instead of 502-ing.
-8. **Timeouts**: `requests` calls use 1800 s. Behind an ingress you want connect/read
-   timeouts, plus SSE-specific no-buffer settings (Traefik: disable compression/flush
-   interval).
+8. **Timeouts**: the upstream call now waits 5 s to connect and 1800 s to read. The
+   open question is a *total* deadline: an engine that trickles bytes can still hold a
+   request (and its thread) for 30 minutes. Behind an ingress you also want SSE no-buffer
+   settings (Traefik: disable compression/flush interval) and read timeouts ≥ the longest
+   generation you allow.
 9. **Multi-engine routing**: needle matching is crude. If you add more engines, introduce
    real model→deployment mapping with weights/fallbacks.
 10. **Retries**: no upstream retry. A 507 (memory guard) is sometimes transient; one

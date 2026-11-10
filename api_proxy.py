@@ -665,7 +665,12 @@ class Handler(BaseHTTPRequestHandler):
                 data=payload,
                 headers=headers,
                 stream=stream,
-                timeout=1800,
+                # 5 s to connect, 30 min to read. Connect is never worth waiting
+                # on: a Mac that slept mid-tunnel leaves a path where SYNs go
+                # unanswered, and the kernel sat here for ~130 s per request.
+                # The long read is deliberate - a 16k-token generation on the
+                # serial engine streams nothing for minutes.
+                timeout=(5, 1800),
             )
         except Exception as e:
             return self._json(
