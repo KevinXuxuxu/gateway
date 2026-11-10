@@ -236,6 +236,10 @@ In a cluster, keys live in the k8s Secret (see `k8s/README.md`): edit the JSON, 
 the Secret, done — no redeploy. `keys.py` (local CLI minter) was removed; mint with
 `openssl rand -hex 20`.
 
+A file that fails to parse fails **closed**: every request gets a 401 and nothing is
+cached, which is what you want, but it looks like every client has the wrong key. One
+line a minute on the log says `keys file unreadable …` so you can tell the two apart.
+
 > **Renamed in this release:** the env prefix is now `GATEWAY_*` (was `BENCH_*`) and the
 > state dir is `~/.llm-gateway` (was `~/.bench-usage`). Old `BENCH_*` names still work for
 > one release; to keep existing keys/history run `mv ~/.bench-usage ~/.llm-gateway`.

@@ -145,10 +145,26 @@ def ensure_state():
         print(f"created {KEYS_FILE} with a default key: {key}", flush=True)
 
 
+_keys_warned_at = 0.0  # last "keys file unreadable" line, so a flood can't bury it
+
+
 def load_keys():
+    global _keys_warned_at
     try:
-        data = json.load(open(KEYS_FILE))
-    except Exception:
+        with open(KEYS_FILE) as f:
+            data = json.load(f)
+    except Exception as err:
+        # Fail closed: a broken key file must not become an open door. But say it
+        # out loud - this reads to every client as a bare "invalid API key", and
+        # editing keys.json then re-applying the Secret is the documented
+        # no-restart update path. Once a minute keeps the log usable.
+        now = time.time()
+        if now - _keys_warned_at >= 60:
+            _keys_warned_at = now
+            print(
+                f"keys file unreadable ({KEYS_FILE}): {err} - every request will 401",
+                flush=True,
+            )
         return {}
     out = {}
     for e in data.get("keys", []):

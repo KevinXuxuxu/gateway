@@ -422,3 +422,27 @@ def test_a_failing_probe_is_still_logged(tmp_path):
     text = (tmp_path / "access.jsonl").read_text()
     proc.kill()
     assert '"status": 503' in text and "backend_unreachable" in text, text[-400:]
+
+
+# --------------------------------------------------------------------------- 7
+def test_broken_keys_file_is_loud_not_silent(tmp_path):
+    """A typo in keys.json used to read as "every key is wrong", with no clue.
+
+    load_keys() swallowed the parse error, so a valid key got a bare 401 and the
+    only hint was the status code. Editing keys.json and re-applying the Secret
+    is the documented no-restart update path, so this is a reachable Tuesday.
+    """
+    proc, base, _ = start_gateway(tmp_path)
+    assert requests.get(f"{base}/v1/models", headers=HDR, timeout=5).status_code == 200
+    good = (tmp_path / "keys.json").read_text()
+    (tmp_path / "keys.json").write_text('{"keys": [oops')
+    broken = requests.get(f"{base}/v1/models", headers=HDR, timeout=5)
+    (tmp_path / "keys.json").write_text(good)
+    fixed = requests.get(f"{base}/v1/models", headers=HDR, timeout=5)
+    proc.kill()
+    proc.wait(timeout=10)
+    out = proc.stdout.read()
+    assert broken.status_code == 401, broken.status_code
+    assert fixed.status_code == 200, fixed.status_code  # hot reload, no restart
+    assert "keys file unreadable" in out, out[-300:]
+    assert out.count("keys file unreadable") == 1, out[-300:]  # not one per request
