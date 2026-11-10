@@ -10,7 +10,12 @@ ENV PYTHONUNBUFFERED=1 \
 WORKDIR /app
 COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-dev --no-install-project
-COPY api_proxy.py usage_report.py access_log.sh ./
+# Only the tool that can run inside the pod: usage_report.py reads the log files,
+# which is how you inspect them over `kubectl exec`. access_log.sh is deliberately
+# left out - all three of its branches pipe through jq, which this image does not
+# have, so shipping it only produces `jq: command not found` read as "no traffic".
+# Run it next to the log file instead.
+COPY api_proxy.py usage_report.py ./
 RUN useradd -u 10001 -m gateway && mkdir -p /var/lib/gateway && chown -R gateway /var/lib/gateway
 USER 10001
 ENV PATH="/app/.venv/bin:$PATH"
