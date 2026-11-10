@@ -2,8 +2,8 @@
 
 A small, dependency-light HTTP gateway that fronts one or more **MTPLX** model servers
 (Apple-silicon inference engines) and gives OpenAI- and Anthropic-shaped clients a
-single authenticated endpoint. It is deliberately boring: no database, no admin UI,
-~470 lines of Python that you can read end to end.
+single authenticated endpoint. It is deliberately boring: no database, no admin UI, no
+framework — one Python file you can read end to end.
 
 This folder is self-contained. Take it to another machine and keep building.
 
@@ -144,7 +144,7 @@ second replica.
 
 | knob | default | why |
 |---|---|---|
-| `GATEWAY_MAX_TOKENS` | 16384 | clamp `max_tokens` **and** `max_output_tokens`; a 32k-output request pins a serial engine for ~12 min |
+| `GATEWAY_MAX_TOKENS` | 8192 | clamp `max_tokens` **and** `max_output_tokens`; a 32k-output request pins a serial engine for ~12 min |
 | `GATEWAY_MAX_PROMPT_CHARS` | 1 200 000 (~300k tok) | anti-abuse only — the model's context window is the real limit |
 | `GATEWAY_MAX_BODY_BYTES` | 16 MB | memory-exhaustion guard |
 | `GATEWAY_CORS_ORIGIN` | off | set `*` or an origin for webview/BYOK apps |
@@ -222,7 +222,7 @@ out of Loki — is `kube/monitoring/grafana/dashboards/llm-gateway.json` in the 
 | `GATEWAY_LOG_STDOUT` | `0` | mirror records to stdout |
 | `GATEWAY_METRICS_PORT` | `0` | Prometheus listener port (9091 in the cluster); `0` = no metrics |
 | `GATEWAY_METRICS_ADDR` | `127.0.0.1` | only raise it to `0.0.0.0` where the scraper reaches the pod IP |
-| `GATEWAY_MAX_TOKENS` | 16384 | output clamp |
+| `GATEWAY_MAX_TOKENS` | 8192 | output clamp (`k8s/configmap.yaml` raises it to 16384 for the cluster) |
 | `GATEWAY_MAX_PROMPT_CHARS` | 1 200 000 | prompt ceiling |
 | `GATEWAY_MAX_BODY_BYTES` | 16 MB | body ceiling |
 | `GATEWAY_RATE_PER_MIN` | 120 | per-key rate limit |
@@ -300,9 +300,13 @@ Ordered by how much they matter for a cluster deployment:
    upstream (non-stream + SSE usage, 401/429/500, probes not counted, metrics absent from
    the app port). Still missing: auth matrix, routing, clamps, quota accounting with cached
    tokens, CORS preflight.
-7. **Upstream health**: `/health` only checks the gateway. Add a cheap upstream probe
-   (`GET /v1/models` with a 2 s timeout, cached 10 s) and expose readiness separately from
-   liveness so a dead Mac drains traffic instead of 502-ing.
+7. **No failover between engines.** `/readyz` already probes each backend
+   (`GET /v1/models`, 2 s timeout, cached 10 s) and reports ready if at least one answers,
+   so stopping one engine does not drain the gateway — but a request for a model on the
+   engine that is down still arrives, gets pinned, and answers 502. Two engines on one
+   host is a single point of failure with extra steps: the missing piece is refusing or
+   rerouting those calls (per-model readiness, or one bounded retry on the other engine),
+   not a better probe.
 8. **Timeouts**: the upstream call now waits 5 s to connect and 1800 s to read. The
    open question is a *total* deadline: an engine that trickles bytes can still hold a
    request (and its thread) for 30 minutes. Behind an ingress you also want SSE no-buffer
