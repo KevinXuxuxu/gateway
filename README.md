@@ -131,7 +131,12 @@ hit rate; charging the raw `prompt_tokens` burns a daily budget in ~200 turns (t
 happened). If you port this to an off-the-shelf gateway (litellm, etc.) reproduce this
 rule with cache-aware pricing or a hook — a naive `tpm` limit is wrong for this workload.
 
-Rate limiting is a simple in-process sliding minute per key (`GATEWAY_RATE_PER_MIN`, 120).
+Rate limiting is a per-key count of `GATEWAY_RATE_PER_MIN` (120) requests in a 60-second
+window, held in process memory. The window opens at the first request after a quiet
+minute, so it is **fixed**, not rolling: a client sitting on the limit can spend ~2x
+across a boundary, and the engine's own queue absorbs the difference. `GATEWAY_DAILY_TOKEN_CAP`
+is counted the same way (§3 above). Both are per-process — see §8.1 before adding a
+second replica.
 
 ---
 

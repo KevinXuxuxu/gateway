@@ -189,7 +189,13 @@ def key_name(presented):
 
 
 def check_quota(who):
-    """Per-key requests/minute and daily token cap. Returns (ok, reason)."""
+    """Per-key requests/minute and daily token cap. Returns (ok, reason).
+
+    Fixed 60-second window, anchored at the first request after a quiet minute -
+    not a rolling window, so ~2x the limit is possible across a boundary. Cheap,
+    and enough to stop a runaway client. tests/test_quota_window.py pins this,
+    including the 2x; change the algorithm there and in README §3 together.
+    """
     now = time.time()
     with _rl_lock:
         st = _rl.setdefault(
