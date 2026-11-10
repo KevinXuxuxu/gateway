@@ -28,7 +28,7 @@ This folder is self-contained. Take it to another machine and keep building.
 ```
 
 The engines are **stateful and memory-bound**; the gateway is **stateless except for
-in-memory quota counters** (see §7). That asymmetry is why the gateway is the part that
+in-memory quota counters** (see §8.1). That asymmetry is why the gateway is the part that
 belongs in a cluster and the engines must stay on the metal.
 
 ---
@@ -37,7 +37,8 @@ belongs in a cluster and the engines must stay on the metal.
 
 ### 2.1 Client → gateway (this is what you must not break)
 
-Base URL `http://<gateway>/v1`. All endpoints require a key:
+Base URL `http://<gateway>/v1`. Every endpoint needs a key except `/health`, `/healthz`
+and `/readyz`:
 
 ```
 Authorization: Bearer <client-key>      (OpenAI-style clients)
@@ -52,7 +53,8 @@ x-api-key: <client-key>                 (Anthropic-style clients)
 | `/v1/completions` | POST | legacy prompt-style |
 | `/v1/models` | GET | list of served model ids (auth required) |
 | `/usage/summary` | GET | per-key × model token totals (auth required) |
-| `/health` | GET | **unauthenticated** liveness |
+| `/health` · `/healthz` | GET | **unauthenticated** liveness: the gateway answers in ms, engines not consulted |
+| `/readyz` | GET | **unauthenticated** readiness: probes each engine (`/v1/models`, 2 s timeout, cached 10 s) |
 
 Model selection is by the `model` field only. Routing is a **substring match on the model
 id** (`next` → heavy, `35b` → fast), configured per deployment — see `--backends`.
@@ -65,12 +67,20 @@ Errors are JSON `{"error": {"message": ...}}` with these codes:
 
 | code | meaning |
 |---|---|
-| 400 | malformed JSON, or upstream rejected the request (e.g. context too long) |
+| 400 | malformed JSON, a body that is not a JSON object (a bare list or string), or an upstream 4xx such as "context too long" |
 | 401 | unknown/absent client key (`reason: invalid_key`) |
 | 404 | unknown path, or `unknown_model` |
 | 413 | `body_too_large` (>16 MB) or `prompt_too_large` (see §4) |
 | 429 | per-key rate limit or daily compute-token cap |
-| 502 | engine unreachable (gateway cannot reach `:8100`/`:8101`) |
+| 502 | engine unreachable (gateway cannot reach `:8100`/`:8101`, or it refused the shape) |
+
+**A reply to a POST ends the connection** — it carries `Connection: close`, and streamed
+replies do too. Two reasons, both load-bearing: a rejected POST's body was either never
+read (401/413/429) or is junk (400), and leaving those bytes in the socket makes them the
+next request line on that connection; and a stream that ends with a close lets a client
+reading to end-of-stream finish instead of waiting out its own read timeout. Clients
+reconnect for the next call. Tests in `tests/test_http_contract.py` pin this; do not
+"optimise" the close away.
 
 ### 2.2 Gateway → engine (MTPLX)
 
@@ -98,7 +108,7 @@ Engine-specific behaviours you must expect (they are not gateway bugs):
 |---|---|---|
 | `400 ... maximum context length is N tokens` | prompt + generation exceeds the served window | passed through |
 | `507 insufficient memory: ... engine held X GiB ... past its Y GiB limit` | MTPLX memory guard refused the prefill | passed through; retry or shrink the prompt |
-| `401` | wrong engine key | surfaced as 502-ish failure; check `GATEWAY_BACKEND_KEY` |
+| `401` | wrong engine key | **passed through as 401**, not 502 — and it makes `/readyz` report that engine not-ready. Check `GATEWAY_BACKEND_KEY` |
 | `usage.prompt_tokens_details.cached_tokens` | prefix-cache hits | **free** for quota purposes (§3) |
 
 ### 2.3 Engine configuration assumptions
@@ -134,9 +144,10 @@ rule with cache-aware pricing or a hook — a naive `tpm` limit is wrong for thi
 Rate limiting is a per-key count of `GATEWAY_RATE_PER_MIN` (120) requests in a 60-second
 window, held in process memory. The window opens at the first request after a quiet
 minute, so it is **fixed**, not rolling: a client sitting on the limit can spend ~2x
-across a boundary, and the engine's own queue absorbs the difference. `GATEWAY_DAILY_TOKEN_CAP`
-is counted the same way (§3 above). Both are per-process — see §8.1 before adding a
-second replica.
+across a boundary, and the engine's own queue absorbs the difference. The daily cap is a
+separate counter, reset at UTC midnight. Both are per-key and per-process — see §8.1
+before adding a second replica. `tests/test_quota_window.py` pins this behaviour (faked
+clock, no waiting) if you change the algorithm.
 
 ---
 
@@ -216,7 +227,7 @@ out of Loki — is `kube/monitoring/grafana/dashboards/llm-gateway.json` in the 
 |---|---|---|
 | `GATEWAY_PORT` / `GATEWAY_HOST` (or `--port` / `--host`) | 8000 / 127.0.0.1 | listen address |
 | `GATEWAY_BACKENDS` (or `--backends`) | `27b=http://127.0.0.1:8100,35b=http://127.0.0.1:8101` | `needle=url` list; needle matched against model id |
-| `GATEWAY_BACKEND_KEY` | – | engine key forwarded upstream (required) |
+| `GATEWAY_BACKEND_KEY` | – | engine key, sent as `Authorization` + `x-api-key`. Omit it only if the engine runs without `--api-key` |
 | `GATEWAY_KEYS_FILE` | `~/.llm-gateway/keys.json` | client keys (re-read per request) |
 | `GATEWAY_USAGE_DIR` | `~/.llm-gateway` | state/log directory |
 | `GATEWAY_LOG_STDOUT` | `0` | mirror records to stdout |
@@ -258,7 +269,7 @@ uv sync --group dev
 GATEWAY_BACKEND_KEY=... GATEWAY_METRICS_PORT=9091 uv run api_proxy.py --port 8000 --host 0.0.0.0 \
   --backends "next=http://<mac>:8100,35b=http://<mac>:8101"
 ./scripts/smoke_test.sh http://localhost:8000 <client-key> next   # behaviour
-uv run pytest -q                                                   # /metrics + quota accounting
+uv run pytest -q                                                   # whole suite, no engine needed
 uv run ruff format --check . && uv run ruff check .                # style
 ```
 
@@ -266,14 +277,21 @@ uv run ruff format --check . && uv run ruff check .                # style
 The dev group (`pytest`, `ruff`) is what `uv sync --group dev` installs; `uv sync` alone gives
 you the runtime only.
 
-The smoke test needs a live engine; `tests/test_metrics.py` ships its own fake one, so it runs
-anywhere. With `GATEWAY_METRICS_PORT` set, `curl localhost:9091/metrics` shows the counters after
-the first request.
+The smoke test needs a live engine. The three test files do not, and `uv run pytest` is the
+same sequence CI runs (`uv sync --group dev` → ruff format → ruff check → pytest):
+`tests/test_metrics.py` and `tests/test_http_contract.py` start the real gateway against a
+fake engine — the second drives **one reused TCP connection**, which is where the protocol
+bugs hide — and `tests/test_quota_window.py` runs the throttle on a faked clock. With
+`GATEWAY_METRICS_PORT` set, `curl localhost:9091/metrics` shows the counters after the first
+request.
 
-Docker/k8s: `Dockerfile` + `k8s/` give a Deployment, Service, ConfigMap, Secret example,
-PDB and a Prometheus `ServiceMonitor` (for operator installs only — the checked-in
-deployments scrape with pod annotations). `k8s/README.md` explains what still has to
-change before it is production-correct (see below).
+Docker/k8s: `Dockerfile` builds an image from `api_proxy.py` (+ `usage_report.py` for
+`kubectl exec` inspection). The YAMLs in `k8s/` — deployment, service, configmap, secret
+example, PDB, ServiceMonitor — are **not tracked by git**: `.gitignore` excludes `*.yaml`, so
+a clone gets `k8s/README.md` only. Keep your manifests somewhere versioned; the live ones for
+this deployment live in the turingpi repo under `kube/public/llm-gateway/`, and scrape by pod
+annotation (the `ServiceMonitor` is for operator installs only). `k8s/README.md` lists what
+still has to change before any of it is production-correct.
 
 ---
 
@@ -296,10 +314,12 @@ Ordered by how much they matter for a cluster deployment:
    only stdout (no emptyDir needed) so promtail/fluent-bit picks it up.
 5. **Per-key policy**: model allowlist (a "laptop" key probably should not spend the
    256k-context heavy model) and per-key max concurrency.
-6. **Tests**: `tests/test_metrics.py` covers the metrics path end to end against a fake
-   upstream (non-stream + SSE usage, 401/429/500, probes not counted, metrics absent from
-   the app port). Still missing: auth matrix, routing, clamps, quota accounting with cached
-   tokens, CORS preflight.
+6. **Tests**: three suites run against a fake engine — metrics end to end, the HTTP
+   connection contract (reused connections, error replies, clamps, the crash shapes that
+   used to kill the handler thread), and the quota window on a faked clock. Still missing:
+   the auth matrix (both header styles, `x-api-key`, empty/oversized keys), routing (needle
+   matching and the first-match-wins order), CORS preflight, and quota arithmetic with
+   cached tokens (the `charged` formula is only checked through `/usage/summary`).
 7. **No failover between engines.** `/readyz` already probes each backend
    (`GET /v1/models`, 2 s timeout, cached 10 s) and reports ready if at least one answers,
    so stopping one engine does not drain the gateway — but a request for a model on the

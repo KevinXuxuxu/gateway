@@ -1,5 +1,11 @@
 # Deploying the gateway in k3s
 
+> The `k8s/*.yaml` files this page applies are **not tracked by git** (`.gitignore` excludes
+> `*.yaml`), so a clone has this README only. The manifests actually applied to the cluster are
+> versioned in the turingpi repo under `kube/public/llm-gateway/`; the ones here are the local
+> working copies. Keep any re-created manifest sanitised: no real hostnames, tunnel addresses
+> or keys.
+
 ```bash
 kubectl create namespace llm
 kubectl -n llm apply -f configmap.yaml
