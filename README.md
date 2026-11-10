@@ -156,7 +156,9 @@ the first token; large cold prefills are the risk.
 Two JSON-lines records per request, written to files (and to **stdout** when
 `GATEWAY_LOG_STDOUT=1`, which is how you want it in a cluster):
 
-* **access** — every request including rejections:
+* **access** — every request including rejections, except a `/health` or `/readyz`
+  that answered 200 (two probes every 15 s is ~11.5k lines a day, and
+  `access_log.sh --stats` reads only the last 500):
   `{ts, client, method, path, model, key, key_prefix, status, reason, ms, stream, bytes, ua}`
   * `client` prefers `CF-Connecting-IP`, else the peer address
   * `key_prefix` (first 6 chars) is recorded for **rejected** credentials so you can spot
@@ -190,6 +192,7 @@ Three rules that keep the cardinality finite — every label above is chosen by 
 never taken from client input:
 
 * `/health` and `/readyz` are not counted at all (the kubelet would out-produce your traffic).
+  A probe that answers 503 *is* logged, so a dead engine is still visible in both systems.
 * Unknown paths collapse to `path="other"`, and the model id never becomes a label. The exact
   model, client IP and user agent are in the log records above if you need them.
 * `backend` is the routing needle from `GATEWAY_BACKENDS`, which today is 1:1 with a model.

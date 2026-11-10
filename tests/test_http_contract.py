@@ -346,7 +346,7 @@ def test_writable_logs_are_still_written(tmp_path):
     lines = (tmp_path / "access.jsonl").read_text().splitlines()
     usage = (tmp_path / "usage.jsonl").read_text().splitlines()
     proc.kill()
-    assert len(lines) == 2, lines  # the readiness probe from the harness + the chat
+    assert len(lines) == 1, lines  # only the chat; healthy probes are not logged
     assert '"path": "/v1/chat/completions"' in lines[-1], lines[-1]
     assert len(usage) == 1, usage
 
@@ -389,3 +389,36 @@ def test_a_streamed_reply_terminates(tmp_path):
     assert took < 3, f"streamed reply took {took:.1f}s: never reached an end"
     assert second.status_code == 200, second.status_code
 
+
+# --------------------------------------------------------------------------- 6
+def test_healthy_probes_are_not_logged(tmp_path):
+    """Kubelet chatter used to be the loudest thing in the log.
+
+    Two probes every 15 s is ~11.5k lines a day, which pushes real traffic out
+    of `access_log.sh --stats` (it reads the last 500 lines) and out of the
+    dashboard's log panels.
+    """
+    proc, base, _ = start_gateway(tmp_path)
+    for _ in range(20):
+        assert requests.get(f"{base}/health", timeout=5).status_code == 200
+        assert requests.get(f"{base}/readyz", timeout=5).status_code == 200
+    requests.post(f"{base}/v1/chat/completions", data=GOOD, headers=HDR, timeout=15)
+    time.sleep(0.5)
+    lines = (tmp_path / "access.jsonl").read_text().splitlines()
+    proc.kill()
+    paths = [json.loads(line)["path"] for line in lines]
+    assert paths.count("/health") == 0 and paths.count("/readyz") == 0, paths
+    assert paths.count("/v1/chat/completions") == 1, paths
+
+
+def test_a_failing_probe_is_still_logged(tmp_path):
+    """The exception matters more than the rule: a dead engine must show up."""
+    dead = free_port()  # nothing listens there
+    proc, base, _ = start_gateway(
+        tmp_path, GATEWAY_BACKENDS=f"fake=http://127.0.0.1:{dead}"
+    )
+    assert requests.get(f"{base}/readyz", timeout=5).status_code == 503
+    time.sleep(0.4)
+    text = (tmp_path / "access.jsonl").read_text()
+    proc.kill()
+    assert '"status": 503' in text and "backend_unreachable" in text, text[-400:]

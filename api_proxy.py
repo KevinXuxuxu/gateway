@@ -230,7 +230,16 @@ def append_log(path, line):
 
 
 def log_access(rec):
-    """Append one line per HTTP request: accepted *and* rejected."""
+    """Append one line per HTTP request: accepted *and* rejected.
+
+    Healthy probes are the exception, and the same PROBE_PATHS rule that keeps
+    them out of the counters keeps them out of the log: /health and /readyz run
+    eight times a minute, which is ~11.5k lines a day of kubelet chatter burying
+    every real 4xx in the file and in Loki. A probe that does NOT answer 200 is
+    still written - a 503 there is the only non-metric trace of a dead engine.
+    """
+    if rec.get("path") in PROBE_PATHS and rec.get("status") == 200:
+        return
     line = json.dumps(rec)
     if LOG_STDOUT:
         print(json.dumps({"log": "access", **rec}), flush=True)
