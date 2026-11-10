@@ -46,9 +46,24 @@ class FakeEngine(BaseHTTPRequestHandler):
         n = int(self.headers.get("Content-Length") or 0)
         raw = self.rfile.read(n) or b"{}"
         try:
-            SEEN.append(json.loads(raw))
+            body = json.loads(raw)
         except Exception:
-            SEEN.append(raw)
+            body = None
+        SEEN.append(body if body is not None else raw)
+        if isinstance(body, dict) and body.get("stream"):
+            # A real engine ends its SSE body; the last frame is [DONE].
+            self.send_response(200)
+            self.send_header("Content-Type", "text/event-stream")
+            self.end_headers()
+            for chunk in [
+                '{"choices":[{"delta":{"content":"ok"}}]}',
+                '{"choices":[{"delta":{}}],"usage":{"prompt_tokens":9,"completion_tokens":2}}',
+                "[DONE]",
+            ]:
+                self.wfile.write(f"data: {chunk}\n\n".encode())
+                self.wfile.flush()
+            self.close_connection = True
+            return
         self._reply(200, json.dumps({"id": "x", "choices": [], "usage": {}}).encode())
 
     def _reply(self, code, body):
@@ -334,3 +349,43 @@ def test_writable_logs_are_still_written(tmp_path):
     assert len(lines) == 2, lines  # the readiness probe from the harness + the chat
     assert '"path": "/v1/chat/completions"' in lines[-1], lines[-1]
     assert len(usage) == 1, usage
+
+
+def test_a_streamed_reply_terminates(tmp_path):
+    """SSE must reach the client with an end, not just a slow trickle.
+
+    The gateway sends `Connection: close` on this path and http.server turns
+    that into an actual close, so a client that reads to end-of-stream finishes.
+    Pinning it because the header is easy to lose in a refactor, and without it
+    such a client waits for its own read timeout on every streamed turn.
+    """
+    proc, base, _ = start_gateway(tmp_path)
+    session = requests.Session()
+    url = f"{base}/v1/chat/completions"
+    t0 = time.time()
+    first = session.post(
+        f"{url}",
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
+        headers=HDR,
+        timeout=6,
+    )
+    took = time.time() - t0
+    second = session.post(
+        f"{url}",
+        json={
+            "model": "fake-model",
+            "messages": [{"role": "user", "content": "hi"}],
+            "stream": True,
+        },
+        headers=HDR,
+        timeout=6,
+    )
+    proc.kill()
+    assert b"[DONE]" in first.content, first.content[:120]
+    assert took < 3, f"streamed reply took {took:.1f}s: never reached an end"
+    assert second.status_code == 200, second.status_code
+
