@@ -52,7 +52,12 @@ class FakeEngine(BaseHTTPRequestHandler):
                 return self._send(401, b'{"error":"bad engine key"}')
             return self._send(
                 200,
-                json.dumps({"object": "list", "data": [{"id": "fake-model"}]}).encode(),
+                json.dumps(
+                    {
+                        "object": "list",
+                        "data": [{"id": "fake-model"}, {"id": "fake-boom"}],
+                    }
+                ).encode(),
             )
         return self._send(404, b'{"error":"nope"}')
 
@@ -107,7 +112,7 @@ def start_stack(tmp_path, rate_per_min="120"):
         GATEWAY_USAGE_DIR=str(tmp_path),
         GATEWAY_KEYS_FILE=str(keys),
         GATEWAY_BACKEND_KEY="engine-key",
-        GATEWAY_BACKENDS=f"fake=http://127.0.0.1:{engine_port}",
+        GATEWAY_ENGINES=f"http://127.0.0.1:{engine_port}",
         GATEWAY_METRICS_PORT=str(metrics_port),
         GATEWAY_RATE_PER_MIN=rate_per_min,
         GATEWAY_LOG_STDOUT="1",
@@ -137,7 +142,7 @@ def start_stack(tmp_path, rate_per_min="120"):
     else:
         proc.kill()
         raise AssertionError("gateway did not come up:\n" + proc.stdout.read())
-    return proc, base, f"http://127.0.0.1:{metrics_port}"
+    return proc, base, f"http://127.0.0.1:{metrics_port}", engine_port
 
 
 def metrics_text(proxy):
@@ -168,7 +173,7 @@ def sample(text, name):
 
 
 def test_metrics_end_to_end(tmp_path):
-    proc, base, metrics_base = start_stack(tmp_path)
+    proc, base, metrics_base, engine_port = start_stack(tmp_path)
     proxy = (proc, base, metrics_base)
     hdr = {"Authorization": f"Bearer {KEY}"}
 
@@ -196,9 +201,9 @@ def test_metrics_end_to_end(tmp_path):
         proxy,
         [
             'gateway_requests_total{key="laptop",path="/v1/chat/completions",status="200"}',
-            'gateway_tokens_total{backend="fake",key="laptop",kind="prompt"} 100.0',
-            'gateway_tokens_total{backend="fake",key="laptop",kind="cached"} 60.0',
-            'gateway_tokens_total{backend="fake",key="laptop",kind="charged"} 60.0',
+            f'gateway_tokens_total{{backend="127.0.0.1:{engine_port}",key="laptop",kind="prompt"}} 100.0',
+            f'gateway_tokens_total{{backend="127.0.0.1:{engine_port}",key="laptop",kind="cached"}} 60.0',
+            f'gateway_tokens_total{{backend="127.0.0.1:{engine_port}",key="laptop",kind="charged"}} 60.0',
         ],
     )
 
@@ -215,8 +220,8 @@ def test_metrics_end_to_end(tmp_path):
     wait_metrics(
         proxy,
         [
-            'gateway_upstream_seconds_count{backend="fake",stream="true"} 1.0',
-            'gateway_upstream_seconds_count{backend="fake",stream="false"} 1.0',
+            f'gateway_upstream_seconds_count{{backend="127.0.0.1:{engine_port}",stream="true"}} 1.0',
+            f'gateway_upstream_seconds_count{{backend="127.0.0.1:{engine_port}",stream="false"}} 1.0',
         ],
     )
 
@@ -241,14 +246,14 @@ def test_metrics_end_to_end(tmp_path):
         proxy,
         [
             'gateway_requests_total{key="laptop",path="/v1/chat/completions",status="500"} 1.0',
-            'gateway_upstream_inflight{backend="fake"} 0.0',
+            f'gateway_upstream_inflight{{backend="127.0.0.1:{engine_port}"}} 0.0',
         ],
     )
     proc.kill()
 
 
 def test_quota_denial_is_counted(tmp_path):
-    proc, base, metrics_base = start_stack(tmp_path, rate_per_min="2")
+    proc, base, metrics_base, _ = start_stack(tmp_path, rate_per_min="2")
     proxy = (proc, base, metrics_base)
     hdr = {"Authorization": f"Bearer {KEY}"}
     payload = {"model": "fake-model", "messages": [{"role": "user", "content": "hi"}]}

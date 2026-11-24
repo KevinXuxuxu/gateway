@@ -18,8 +18,8 @@ verify without asking anyone. Read `README.md` first; §8 is the rationale.
       `gateway_upstream_inflight{backend}`, counter `gateway_quota_denials_total{reason}`.
       Served on a **second listener** (`GATEWAY_METRICS_PORT`, default 0 = off, and
       `GATEWAY_METRICS_ADDR` default 127.0.0.1), never on the app port: that one is public
-      and the series name every key. Labels are gateway-chosen (engine needle, not the client's
-      model id) so cardinality stays finite; `/health` and `/readyz` are not counted.
+      and the series name every key. Labels are gateway-chosen (engine slot address, not
+      the client's model id, so cardinality stays finite); `/health` and `/readyz` are not counted.
       *Accept:* `curl :9091/metrics` shows them (`tests/test_metrics.py` asserts it); the
       deployment's `prometheus.io/{scrape,port,path}` annotations do the scraping, and
       `k8s/servicemonitor.yaml` is the operator-only alternative.
@@ -54,8 +54,11 @@ verify without asking anyone. Read `README.md` first; §8 is the rationale.
       *Accept:* `uv run pytest -q` green; the smoke test alone is not enough.
 - [ ] **Ingress tuning doc** for Traefik: disable compression for `text/event-stream`,
       flush interval, read/send timeouts ≥ longest generation (1800 s).
-- [ ] **Idempotent model map**: replace needle substring routing with an explicit
-      model→deployment map (+ weights/fallback) once there are >2 engines.
+- [x] **Idempotent model map**: done as slot **discovery** — `GATEWAY_ENGINES`
+  (port ranges, e.g. `http://mac:8100-8110`) replaces needle matching; the gateway
+  probes each slot's `/v1/models` and routes by exact model id, so engines swap
+  models with no gateway change (`tests/test_discovery.py` pins the swap). Still
+  open for >2 engines: weights/fallback between slots serving the same id.
 
 ## Invariants — do not break these
 

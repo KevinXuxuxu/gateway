@@ -3,14 +3,14 @@
 
 Why this exists: MTPLX's own `--api-key-file` reads the file as ONE secret, so it
 cannot serve several issued keys from one file. This proxy owns the key list, and
-forwards to the two backends by model name:
+forwards to the engine slots (model ids discovered from each slot's /v1/models):
 
-    :8000  (this proxy)  ->  :8100  27B Q8       (serial, 256k ctx)
-                             :8101  35B-A3B      (ar_batch, 64k ctx)
+    :8000  (this proxy)  ->  engine slots, e.g. 127.0.0.1:8100-8101
+                             (one MTPLX process per slot, whatever model it serves)
 
-Clients point at ONE base URL and pick a model:
+Clients point at ONE base URL and pick a model by exact id, no matter which slot
+serves it - swapping the model an engine runs needs no gateway change:
     http://localhost:8000/v1  +  model=mtplx-qwen38-27b-optimized-quality
-                                 model=mtplx-qwen36-35b-a3b-optimized-speed
 
 Every request is appended to ~/.llm-gateway/usage.jsonl with the key name, model,
 token counts and timing (usage is taken from the OpenAI `usage` object; streaming
@@ -22,13 +22,14 @@ the app port - the ingress forwards every path on :8000 and these series carry p
 usage, while Prometheus scrapes the pod directly.
 
 Usage:
-    GATEWAY_METRICS_PORT=9091 python scripts/api_proxy.py --port 8000 --backends 27b=http://127.0.0.1:8100,35b=http://127.0.0.1:8101
+    GATEWAY_METRICS_PORT=9091 python api_proxy.py --port 8000 --engines http://127.0.0.1:8100-8101
 """
 
 import argparse
 import hashlib
 import json
 import os
+import re
 import signal
 import sys
 import threading
@@ -56,6 +57,10 @@ NO_AUTH = _env("PROXY_NO_AUTH") == "1"
 # the backends authenticate with their own engine key; the proxy authenticates
 # clients against the multi-key list and forwards this credential upstream
 BACKEND_KEY = _env("BACKEND_KEY")
+# Engine slots, e.g. http://mac:8100-8110 (port ranges allowed). Model ids are
+# DISCOVERED from each slot's GET /v1/models; routing is an exact-id lookup, so
+# an engine serves - and swaps - whatever model it wants, no gateway change.
+ENGINES = _env("ENGINES", "http://127.0.0.1:8100-8101")
 MAX_BODY_BYTES = int(_env("MAX_BODY_BYTES", str(16 * 1024 * 1024)))
 MAX_COMPLETION_TOKENS = int(_env("MAX_TOKENS", "8192"))
 # The context window is the real limit (262k on the 27B), so this is only an
@@ -97,7 +102,8 @@ LOGGED_PATHS = (
 
 # Every label value below is chosen by the gateway, never taken from client input:
 # a label built from a client-supplied model id or URL is unbounded cardinality.
-# `backend` is the routing needle from GATEWAY_BACKENDS, which is 1:1 with a model.
+# `backend` is the slot address (host:port) from GATEWAY_ENGINES - configured,
+# bounded by the slot count.
 REQ_TOTAL = Counter(
     "gateway_requests_total",
     "Requests finished, probes excluded",
@@ -120,6 +126,100 @@ UPSTREAM_INFLIGHT = Gauge(
 QUOTA_DENIALS = Counter(
     "gateway_quota_denials_total", "Requests refused by a quota check", ["reason"]
 )
+
+
+# --------------------------------------------------------------- discovery
+# The model -> slot map is rebuilt from the engines' own /v1/models answers: a
+# slot that is down drops out, a slot that comes up (or swaps its model) is
+# picked up by the next lookup that misses. No background thread - every read
+# path refreshes when what it sees is older than its max_age.
+_slots = []  # engine urls, set in main()
+_disc = {"ts": 0.0, "models": {}}  # model id -> (slot label, url)
+_models_raw = []  # merged model objects, served at /v1/models
+_disc_lock = threading.Lock()
+_bad_slot_warned = 0.0
+
+
+def parse_engines(spec):
+    """'http://mac:8100-8110,http://mac2:8100' -> one url per engine slot."""
+    urls = []
+    for part in spec.split(","):
+        part = part.strip().rstrip("/")
+        if not part:
+            continue
+        p = urllib.parse.urlparse(part)
+        host, sep, portspec = p.netloc.rpartition(":")
+        m = re.fullmatch(r"(\d+)(?:-(\d+))?", portspec) if sep else None
+        if p.scheme not in ("http", "https") or not p.netloc or (sep and not m):
+            raise SystemExit(
+                f"bad engines entry {part!r} (want scheme://host[:port[-port]])"
+            )
+        if not sep:
+            urls.append(f"{p.scheme}://{p.netloc}")
+            continue
+        lo, hi = int(m[1]), int(m[2] or m[1])
+        if lo < 1 or hi < lo or hi - lo > 64:
+            raise SystemExit(f"bad port range in {part!r}")
+        urls.extend(f"{p.scheme}://{host}:{n}" for n in range(lo, hi + 1))
+    if not urls:
+        raise SystemExit(f"no engine slots in {spec!r}")
+    return urls
+
+
+def _warn_bad_slot(status):
+    global _bad_slot_warned
+    now = time.time()
+    if now - _bad_slot_warned >= 60:  # once a minute, like the keys-file warning
+        _bad_slot_warned = now
+        print(
+            f"an engine slot answered HTTP {status} - check GATEWAY_BACKEND_KEY",
+            flush=True,
+        )
+
+
+def discover(max_age=30.0):
+    """Refresh the model -> slot map from every slot's GET /v1/models.
+
+    Single-flight: the lock is held across the probes, so concurrent misses
+    coalesce into one round (2 s worst case) instead of one per request.
+    """
+    global _models_raw
+    now = time.time()
+    with _disc_lock:
+        if now - _disc["ts"] < max_age:
+            return
+        results = {}
+
+        def probe(url):
+            try:
+                hdrs = {"Authorization": f"Bearer {BACKEND_KEY}"} if BACKEND_KEY else {}
+                r = requests.get(f"{url}/v1/models", timeout=2, headers=hdrs)
+                results[url] = r.json().get("data", []) if r.status_code == 200 else []
+                if r.status_code != 200:
+                    _warn_bad_slot(r.status_code)
+            except Exception:
+                results[url] = []  # slot down: it just drops out of the map
+
+        threads = [
+            threading.Thread(target=probe, args=(u,), daemon=True) for u in _slots
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(2.5)  # concurrent: ~2 s total, not 2 s x N
+        models, raw, seen = {}, [], set()
+        for url in _slots:
+            for entry in results.get(url, []):
+                mid = entry.get("id")
+                if not mid:
+                    continue
+                if mid not in models:  # first slot advertising an id wins
+                    models[mid] = (urllib.parse.urlparse(url).netloc, url)
+                if mid not in seen:
+                    seen.add(mid)
+                    raw.append(entry)
+        _disc["ts"], _disc["models"] = now, models
+        _models_raw = raw
 
 
 def ensure_state():
@@ -393,16 +493,19 @@ class Handler(BaseHTTPRequestHandler):
             return  # client gone (kube-probe timeout, CF 524, user cancel)
 
     def _pick_backend(self, model):
-        """(needle, url) of the first matching backend, or None.
+        """(slot label, url) serving this exact model id, or None.
 
-        The needle travels with the url because it is the metrics label for the
-        engine: a fixed configured string, never whatever the client typed in `model`.
+        Ids come from the engines (see discover), so a model swap or a slot
+        that just came up is picked up by the request that misses - no config
+        change, no restart.
         """
-        m = (model or "").lower()
-        for needle, url in self.server.backends:
-            if needle in m:
-                return needle, url
-        return None
+        if not model or not isinstance(model, str):
+            return None
+        hit = _disc["models"].get(model)
+        if hit is None:
+            discover(max_age=0)  # miss: one synchronous refresh, then look again
+            hit = _disc["models"].get(model)
+        return hit
 
     # ------------------------------------------------------------------ routing
     def _ready(self):
@@ -423,16 +526,14 @@ class Handler(BaseHTTPRequestHandler):
 
             threads = [
                 threading.Thread(target=probe, args=(url,), daemon=True)
-                for _, url in self.server.backends
+                for url in _slots
             ]
             for t in threads:
                 t.start()
             for t in threads:
                 t.join(2.5)  # concurrent: worst case ~2 s total, not 2 s × N
-            # ready if ANY backend serves — stopping one engine must not drain the gateway
-            ok = bool(threads) and any(
-                results.get(u, False) for _, u in self.server.backends
-            )
+            # ready if ANY slot serves — stopping one engine must not drain the gateway
+            ok = any(results.get(u, False) for u in _slots)
             _readyz["ts"] = now
             _readyz["ok"] = ok
         if _readyz["ok"]:
@@ -455,27 +556,8 @@ class Handler(BaseHTTPRequestHandler):
                 401, {"error": {"message": "invalid API key"}}, reason="invalid_key"
             )
         if path == "/v1/models":
-            seen, data = set(), []
-            for _, url in self.server.backends:
-                try:
-                    hdrs = (
-                        {"Authorization": f"Bearer {BACKEND_KEY}"}
-                        if BACKEND_KEY
-                        else {}
-                    )
-                    r = requests.get(f"{url}/v1/models", timeout=5, headers=hdrs)
-                    if r.status_code != 200:
-                        # a wrong GATEWAY_BACKEND_KEY lands here as 401 — do not hide it
-                        print(f"models: {url} HTTP {r.status_code}", flush=True)
-                        continue
-                    for m in r.json().get("data", []):
-                        if m.get("id") not in seen:
-                            seen.add(m.get("id"))
-                            data.append(m)
-                except Exception as e:
-                    print(f"models: {url} unreachable: {e}", flush=True)
-                    continue
-            return self._json(200, {"object": "list", "data": data}, keyname=who)
+            discover(max_age=5)  # near-live, without probing on every request
+            return self._json(200, {"object": "list", "data": _models_raw}, keyname=who)
         if path == "/usage/summary":
             return self._json(200, self._usage_summary(), keyname=who)
         return self._json(
@@ -841,19 +923,16 @@ def main():
     ap.add_argument("--port", type=int, default=int(_env("PORT", "8000")))
     ap.add_argument("--host", default=_env("HOST", "127.0.0.1"))
     ap.add_argument(
-        "--backends",
-        default=_env("BACKENDS", "27b=http://127.0.0.1:8100,35b=http://127.0.0.1:8101"),
-        help="comma separated needle=url pairs; the needle is matched against the model id",
+        "--engines",
+        default=ENGINES,
+        help="comma separated slots, e.g. http://mac:8100-8110; model ids are discovered from each",
     )
     args = ap.parse_args()
+    global _slots
+    _slots = parse_engines(args.engines)
     ensure_state()
-    backends = []
-    for part in args.backends.split(","):
-        needle, _, url = part.partition("=")
-        backends.append((needle.strip().lower(), url.strip().rstrip("/")))
     ThreadingHTTPServer.allow_reuse_address = True
     srv = ThreadingHTTPServer((args.host, args.port), Handler)
-    srv.backends = backends
     srv.daemon_threads = True
     srv.block_on_close = (
         False  # server_close must not join threads; drain below is bounded
@@ -870,7 +949,12 @@ def main():
 
     signal.signal(signal.SIGTERM, _stop)
 
-    print(f"proxy on http://{args.host}:{args.port} -> {backends}", flush=True)
+    discover()  # fill the map before the first request; misses refresh on demand
+    print(
+        f"proxy on http://{args.host}:{args.port} -> {len(_slots)} engine slot(s), "
+        f"{len(_disc['models'])} model(s): {', '.join(sorted(_disc['models'])) or '-'}",
+        flush=True,
+    )
     if metrics:
         print(f"metrics on http://{METRICS_ADDR}:{METRICS_PORT}/metrics", flush=True)
     print(f"keys: {KEYS_FILE}  usage: {USAGE_LOG}", flush=True)

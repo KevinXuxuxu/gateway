@@ -101,7 +101,7 @@ def start_gateway(tmp_path, break_logs=False, **overrides):
         GATEWAY_USAGE_DIR=str(tmp_path),
         GATEWAY_KEYS_FILE=str(keys),
         GATEWAY_BACKEND_KEY="engine-key",
-        GATEWAY_BACKENDS=f"fake=http://127.0.0.1:{engine_port}",
+        GATEWAY_ENGINES=f"http://127.0.0.1:{engine_port}",
         GATEWAY_RATE_PER_MIN="120",
         GATEWAY_METRICS_PORT="0",
     )
@@ -414,9 +414,7 @@ def test_healthy_probes_are_not_logged(tmp_path):
 def test_a_failing_probe_is_still_logged(tmp_path):
     """The exception matters more than the rule: a dead engine must show up."""
     dead = free_port()  # nothing listens there
-    proc, base, _ = start_gateway(
-        tmp_path, GATEWAY_BACKENDS=f"fake=http://127.0.0.1:{dead}"
-    )
+    proc, base, _ = start_gateway(tmp_path, GATEWAY_ENGINES=f"http://127.0.0.1:{dead}")
     assert requests.get(f"{base}/readyz", timeout=5).status_code == 503
     time.sleep(0.4)
     text = (tmp_path / "access.jsonl").read_text()

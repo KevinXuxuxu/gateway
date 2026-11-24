@@ -56,8 +56,11 @@ x-api-key: <client-key>                 (Anthropic-style clients)
 | `/health` · `/healthz` | GET | **unauthenticated** liveness: the gateway answers in ms, engines not consulted |
 | `/readyz` | GET | **unauthenticated** readiness: probes each engine (`/v1/models`, 2 s timeout, cached 10 s) |
 
-Model selection is by the `model` field only. Routing is a **substring match on the model
-id** (`next` → heavy, `35b` → fast), configured per deployment — see `--backends`.
+Model selection is by the `model` field only. The gateway **discovers model ids**
+from each engine slot (`GET /v1/models`) and routes by **exact id** — an engine
+can serve, or swap, any model with no gateway change. A lookup that misses forces
+one synchronous refresh, so a just-started or just-swapped engine is picked up by
+the very next request. Slots come from `--engines` / `GATEWAY_ENGINES`.
 
 `/metrics` is **not** part of this API. It is served by a second listener on
 `GATEWAY_METRICS_PORT` (9091 in the cluster), so nothing on the public port exposes key
@@ -211,7 +214,8 @@ never taken from client input:
   A probe that answers 503 *is* logged, so a dead engine is still visible in both systems.
 * Unknown paths collapse to `path="other"`, and the model id never becomes a label. The exact
   model, client IP and user agent are in the log records above if you need them.
-* `backend` is the routing needle from `GATEWAY_BACKENDS`, which today is 1:1 with a model.
+* `backend` is the slot address (`host:port`) from `GATEWAY_ENGINES` — gateway-chosen,
+  bounded by the slot list.
 
 Token kinds overlap on purpose (`prompt` includes `cached`; `charged` is the §3 quota formula):
 **never sum `gateway_tokens_total` across kinds.**
@@ -226,7 +230,7 @@ out of Loki — is `kube/monitoring/grafana/dashboards/llm-gateway.json` in the 
 | env | default | meaning |
 |---|---|---|
 | `GATEWAY_PORT` / `GATEWAY_HOST` (or `--port` / `--host`) | 8000 / 127.0.0.1 | listen address |
-| `GATEWAY_BACKENDS` (or `--backends`) | `27b=http://127.0.0.1:8100,35b=http://127.0.0.1:8101` | `needle=url` list; needle matched against model id |
+| `GATEWAY_ENGINES` (or `--engines`) | `http://127.0.0.1:8100-8101` | engine slots, `scheme://host:port[-port]`, comma separated; model ids discovered from each slot |
 | `GATEWAY_BACKEND_KEY` | – | engine key, sent as `Authorization` + `x-api-key`. Omit it only if the engine runs without `--api-key` |
 | `GATEWAY_KEYS_FILE` | `~/.llm-gateway/keys.json` | client keys (re-read per request) |
 | `GATEWAY_USAGE_DIR` | `~/.llm-gateway` | state/log directory |
@@ -267,7 +271,7 @@ line a minute on the log says `keys file unreadable …` so you can tell the two
 ```bash
 uv sync --group dev
 GATEWAY_BACKEND_KEY=... GATEWAY_METRICS_PORT=9091 uv run api_proxy.py --port 8000 --host 0.0.0.0 \
-  --backends "next=http://<mac>:8100,35b=http://<mac>:8101"
+  --engines "http://<mac>:8100-8110"
 ./scripts/smoke_test.sh http://localhost:8000 <client-key> next   # behaviour
 uv run pytest -q                                                   # whole suite, no engine needed
 uv run ruff format --check . && uv run ruff check .                # style
@@ -317,9 +321,10 @@ Ordered by how much they matter for a cluster deployment:
 6. **Tests**: three suites run against a fake engine — metrics end to end, the HTTP
    connection contract (reused connections, error replies, clamps, the crash shapes that
    used to kill the handler thread), and the quota window on a faked clock. Still missing:
-   the auth matrix (both header styles, `x-api-key`, empty/oversized keys), routing (needle
-   matching and the first-match-wins order), CORS preflight, and quota arithmetic with
-   cached tokens (the `charged` formula is only checked through `/usage/summary`).
+   the auth matrix (both header styles, `x-api-key`, empty/oversized keys), routing
+   (discovery: exact-id match, the swap refresh, unknown_model), CORS preflight, and quota
+   arithmetic with cached tokens (the `charged` formula is only checked through
+   `/usage/summary`).
 7. **No failover between engines.** `/readyz` already probes each backend
    (`GET /v1/models`, 2 s timeout, cached 10 s) and reports ready if at least one answers,
    so stopping one engine does not drain the gateway — but a request for a model on the
@@ -332,8 +337,10 @@ Ordered by how much they matter for a cluster deployment:
    request (and its thread) for 30 minutes. Behind an ingress you also want SSE no-buffer
    settings (Traefik: disable compression/flush interval) and read timeouts ≥ the longest
    generation you allow.
-9. **Multi-engine routing**: needle matching is crude. If you add more engines, introduce
-   real model→deployment mapping with weights/fallbacks.
+9. **Multi-engine routing — done as discovery.** Slots (`GATEWAY_ENGINES`, port ranges)
+   are probed and routing is an exact model-id lookup, so engines come, go and swap
+   models with no gateway change. Still open for a bigger fleet: weights/fallback
+   between slots serving the same id.
 10. **Retries**: no upstream retry. A 507 (memory guard) is sometimes transient; one
     bounded retry with backoff, only for idempotent non-streaming requests, is reasonable.
 

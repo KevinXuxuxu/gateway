@@ -69,7 +69,7 @@ your Prometheus and Loki datasources. It needs `GATEWAY_LOG_STDOUT=1` for the fo
 
 ## Things that WILL bite you
 
-1. **Reachability of the Mac.** `BACKENDS` must use an address the cluster can reach
+1. **Reachability of the Mac.** `ENGINES` must use an address the cluster can reach
    (WireGuard/Tailscale preferred). The MTPLX engines bind `127.0.0.1` by default — you
    must rebind them (`--host <overlay-ip>`) and restrict with `pf`/firewall to cluster
    nodes only. Keep `--api-key` on the engines as a second factor.
