@@ -54,7 +54,7 @@ x-api-key: <client-key>                 (Anthropic-style clients)
 | `/v1/models` | GET | list of served model ids (auth required) |
 | `/usage/summary` | GET | per-key × model token totals (auth required) |
 | `/health` · `/healthz` | GET | **unauthenticated** liveness: the gateway answers in ms, engines not consulted |
-| `/readyz` | GET | **unauthenticated** readiness: probes each engine (`/v1/models`, 2 s timeout, cached 10 s) |
+| `/readyz` | GET | **unauthenticated** readiness: probes each engine (`/v1/models`, 1 s timeout, cached 10 s). A slot that accepts the connection but does not answer in 1 s is **busy, not down** — draining the pod there 503s every client for a whole turn |
 
 Model selection is by the `model` field only. The gateway **discovers model ids**
 from each engine slot (`GET /v1/models`) and routes by **exact id** — an engine
@@ -73,7 +73,7 @@ Errors are JSON `{"error": {"message": ...}}` with these codes:
 | 400 | malformed JSON, a body that is not a JSON object (a bare list or string), or an upstream 4xx such as "context too long" |
 | 401 | unknown/absent client key (`reason: invalid_key`) |
 | 404 | unknown path, or `unknown_model` |
-| 413 | `body_too_large` (>16 MB) or `prompt_too_large` (see §4) |
+| 413 | `body_too_large` (>32 MB) or `prompt_too_large` (see §4) |
 | 429 | per-key rate limit or daily compute-token cap |
 | 502 | engine unreachable (gateway cannot reach `:8100`/`:8101`, or it refused the shape) |
 
@@ -159,8 +159,8 @@ clock, no waiting) if you change the algorithm.
 | knob | default | why |
 |---|---|---|
 | `GATEWAY_MAX_TOKENS` | 8192 | clamp `max_tokens` **and** `max_output_tokens`; a 32k-output request pins a serial engine for ~12 min |
-| `GATEWAY_MAX_PROMPT_CHARS` | 1 200 000 (~300k tok) | anti-abuse only — the model's context window is the real limit |
-| `GATEWAY_MAX_BODY_BYTES` | 16 MB | memory-exhaustion guard |
+| `GATEWAY_MAX_PROMPT_CHARS` | 4 000 000 (~1M tok) | anti-abuse only — the model's context window is the real limit |
+| `GATEWAY_MAX_BODY_BYTES` | 32 MB | memory-exhaustion guard |
 | `GATEWAY_CORS_ORIGIN` | off | set `*` or an origin for webview/BYOK apps |
 
 Behind Cloudflare there is an extra hard constraint: the edge kills an origin that stays
@@ -186,6 +186,10 @@ Two JSON-lines records per request, written to files (and to **stdout** when
     `prompt_too_large:<n>`, `body_too_large:<n>`, `rate limit: …`, `backend_unreachable`
 * **usage** — accepted requests only: `{ts, key, model, prompt_tokens, cached_tokens,
   completion_tokens, charged_tokens, elapsed_s}`
+* **readyz** — one line per failed probe round: `{log: readyz, ready: false, ms,
+  slots: [{url, up, why}]}`, where `why` is `http <code>`, `busy` (connected, would have
+  counted as up), `ConnectTimeout` / `ConnectionError`, or another exception name. The
+  `503` in *access* says the probe failed; this says which slot and which way.
 
 Engine-side telemetry is **not** available over HTTP; MTPLX writes it to files on the
 model host and it must be shipped separately if you want it in the same stack:
@@ -238,8 +242,8 @@ out of Loki — is `kube/monitoring/grafana/dashboards/llm-gateway.json` in the 
 | `GATEWAY_METRICS_PORT` | `0` | Prometheus listener port (9091 in the cluster); `0` = no metrics |
 | `GATEWAY_METRICS_ADDR` | `127.0.0.1` | only raise it to `0.0.0.0` where the scraper reaches the pod IP |
 | `GATEWAY_MAX_TOKENS` | 8192 | output clamp (`k8s/configmap.yaml` raises it to 16384 for the cluster) |
-| `GATEWAY_MAX_PROMPT_CHARS` | 1 200 000 | prompt ceiling |
-| `GATEWAY_MAX_BODY_BYTES` | 16 MB | body ceiling |
+| `GATEWAY_MAX_PROMPT_CHARS` | 4 000 000 | prompt ceiling |
+| `GATEWAY_MAX_BODY_BYTES` | 32 MB | body ceiling |
 | `GATEWAY_RATE_PER_MIN` | 120 | per-key rate limit |
 | `GATEWAY_DAILY_TOKEN_CAP` | 200 000 000 | per-key compute tokens/day |
 | `GATEWAY_CORS_ORIGIN` | off | CORS origin |
@@ -326,7 +330,7 @@ Ordered by how much they matter for a cluster deployment:
    arithmetic with cached tokens (the `charged` formula is only checked through
    `/usage/summary`).
 7. **No failover between engines.** `/readyz` already probes each backend
-   (`GET /v1/models`, 2 s timeout, cached 10 s) and reports ready if at least one answers,
+   (`GET /v1/models`, 1 s timeout, cached 10 s) and reports ready if at least one answers,
    so stopping one engine does not drain the gateway — but a request for a model on the
    engine that is down still arrives, gets pinned, and answers 502. Two engines on one
    host is a single point of failure with extra steps: the missing piece is refusing or

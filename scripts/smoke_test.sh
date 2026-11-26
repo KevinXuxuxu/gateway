@@ -53,7 +53,7 @@ chk "unknown model"              404 "$(post /v1/chat/completions '{"model":"def
 
 # large bodies must go via a file: a 1.3 MB argv exceeds ARG_MAX
 BIGF=$(mktemp)
-python3 -c "import json;print(json.dumps({'model':'$MODEL','messages':[{'role':'user','content':'x'*1300000}]}))" > "$BIGF"
+python3 -c "import json;print(json.dumps({'model':'$MODEL','messages':[{'role':'user','content':'x'*4100000}]}))" > "$BIGF"
 chk "oversized prompt rejected"  413 "$(curl -s -o /dev/null -w '%{http_code}' -m 120 \
   -H "Authorization: Bearer $KEY" -H 'Content-Type: application/json' \
   --data-binary "@$BIGF" "$BASE/v1/chat/completions")"

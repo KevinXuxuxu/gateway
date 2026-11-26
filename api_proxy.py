@@ -61,11 +61,11 @@ BACKEND_KEY = _env("BACKEND_KEY")
 # DISCOVERED from each slot's GET /v1/models; routing is an exact-id lookup, so
 # an engine serves - and swaps - whatever model it wants, no gateway change.
 ENGINES = _env("ENGINES", "http://127.0.0.1:8100-8101")
-MAX_BODY_BYTES = int(_env("MAX_BODY_BYTES", str(16 * 1024 * 1024)))
+MAX_BODY_BYTES = int(_env("MAX_BODY_BYTES", str(32 * 1024 * 1024)))
 MAX_COMPLETION_TOKENS = int(_env("MAX_TOKENS", "8192"))
-# The context window is the real limit (262k on the 27B), so this is only an
-# anti-abuse ceiling for absurd bodies - not a working limit for long sessions.
-MAX_PROMPT_CHARS = int(_env("MAX_PROMPT_CHARS", str(1_200_000)))  # ~300k tokens
+# The context window is the real limit, so this is only an anti-abuse ceiling
+# for absurd bodies - not a working limit for long sessions.
+MAX_PROMPT_CHARS = int(_env("MAX_PROMPT_CHARS", str(4_000_000)))  # ~1M tokens
 RATE_PER_MIN = int(_env("RATE_PER_MIN", "120"))  # per key
 # Optional CORS for browser/webview clients (native apps don't need it).
 # Empty = disabled. Set to e.g. "*" or a specific origin to enable.
@@ -205,8 +205,12 @@ def discover(max_age=30.0):
         ]
         for t in threads:
             t.start()
+        # One budget for the whole round, not per slot: a range like :8100-8110
+        # that is blackholed (no RST, so every probe waits out its timeout) used
+        # to hold _disc_lock for 2.5 s x slots, blocking the requests behind it.
+        deadline = time.time() + 2.5
         for t in threads:
-            t.join(2.5)  # concurrent: ~2 s total, not 2 s x N
+            t.join(max(0.0, deadline - time.time()))
         models, raw, seen = {}, [], set()
         for url in _slots:
             for entry in results.get(url, []):
@@ -515,14 +519,25 @@ class Handler(BaseHTTPRequestHandler):
             now - _readyz["ts"] >= 10
         ):  # 10 s cache; no single-flight guard (low traffic)
             hdrs = {"Authorization": f"Bearer {BACKEND_KEY}"} if BACKEND_KEY else {}
-            results = {}
+            results, seen = {}, {}  # per slot: is it up, and what said so
 
             def probe(url):
                 try:
-                    r = requests.get(f"{url}/v1/models", timeout=2, headers=hdrs)
+                    # 1 s, not 2: this only has to separate "connected" from "not
+                    # there". kubelet kills the whole request at timeoutSeconds.
+                    r = requests.get(f"{url}/v1/models", timeout=1, headers=hdrs)
                     results[url] = r.status_code == 200
-                except Exception:
+                    seen[url] = f"http {r.status_code}"
+                except requests.exceptions.ReadTimeout:
+                    # Connected, then no answer in 1 s: the engine is generating.
+                    # A queue is not an outage. Reporting it as one drained the only
+                    # replica (no endpoints -> ingress 503 for every client) for the
+                    # whole length of a turn.
+                    results[url] = True
+                    seen[url] = "busy"
+                except Exception as e:
                     results[url] = False
+                    seen[url] = type(e).__name__
 
             threads = [
                 threading.Thread(target=probe, args=(url,), daemon=True)
@@ -530,12 +545,38 @@ class Handler(BaseHTTPRequestHandler):
             ]
             for t in threads:
                 t.start()
+            # One budget for all slots, not 2.5 s each: kubelet's timeoutSeconds
+            # covers the whole request, and a blackholed port range ate it.
+            deadline = time.time() + 2.5
             for t in threads:
-                t.join(2.5)  # concurrent: worst case ~2 s total, not 2 s × N
+                t.join(max(0.0, deadline - time.time()))
             # ready if ANY slot serves — stopping one engine must not drain the gateway
             ok = any(results.get(u, False) for u in _slots)
             _readyz["ts"] = now
             _readyz["ok"] = ok
+            if not ok:
+                # A 503 also lands in the access log, but with no detail. This is
+                # the line that says which slot and which way it failed - the
+                # difference between "the Mac is asleep", "wrong engine key" and
+                # "that port was never listening".
+                print(
+                    json.dumps(
+                        {
+                            "log": "readyz",
+                            "ready": False,
+                            "ms": round((time.time() - now) * 1000),
+                            "slots": [
+                                {
+                                    "url": u,
+                                    "up": results.get(u, False),
+                                    "why": seen.get(u),
+                                }
+                                for u in _slots
+                            ],
+                        }
+                    ),
+                    flush=True,
+                )
         if _readyz["ok"]:
             return self._json(200, {"ready": True}, reason="ready")
         return self._json(
@@ -681,7 +722,7 @@ class Handler(BaseHTTPRequestHandler):
                 413,
                 {
                     "error": {
-                        "message": f"prompt too large ({chars} chars > {MAX_PROMPT_CHARS} = ~300k tokens). "
+                        "message": f"prompt too large ({chars} chars > {MAX_PROMPT_CHARS} = ~1M tokens). "
                         f"The model's context window is the practical limit; over a Cloudflare "
                         f"tunnel a *cold* prefill above ~70k tokens can also hit CF's 100s "
                         f"origin timeout (cached turns are fast)."

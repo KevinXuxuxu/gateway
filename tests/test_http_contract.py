@@ -419,7 +419,33 @@ def test_a_failing_probe_is_still_logged(tmp_path):
     time.sleep(0.4)
     text = (tmp_path / "access.jsonl").read_text()
     proc.kill()
+    proc.wait(timeout=10)
+    out = proc.stdout.read()
     assert '"status": 503' in text and "backend_unreachable" in text, text[-400:]
+    # and the detail the access record cannot carry: which slot, which way
+    failed = [json.loads(x) for x in out.splitlines() if '"log": "readyz"' in x]
+    assert failed and failed[-1]["ready"] is False, out[-600:]
+    assert failed[-1]["slots"] == [
+        {"url": f"http://127.0.0.1:{dead}", "up": False, "why": "ConnectionError"}
+    ], failed
+
+
+def test_a_busy_engine_does_not_drain_the_pod(tmp_path):
+    """A serial engine answering nothing while it generates is up, not down.
+
+    The 2 s /v1/models probe raised ReadTimeout, /readyz answered 503, and after
+    three probes the only replica left the Service - so a long agent turn 503'd
+    every client while the engine was healthy and generating.
+    """
+    busy = socket.socket()
+    busy.bind(("127.0.0.1", 0))
+    busy.listen(8)  # accepts the connection, never answers
+    port = busy.getsockname()[1]
+    proc, base, _ = start_gateway(tmp_path, GATEWAY_ENGINES=f"http://127.0.0.1:{port}")
+    r = requests.get(f"{base}/readyz", timeout=10)
+    proc.kill()
+    busy.close()
+    assert r.status_code == 200, r.text
 
 
 # --------------------------------------------------------------------------- 7
